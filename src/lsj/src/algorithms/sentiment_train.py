@@ -192,17 +192,20 @@ class TrainConfig:
 
     model_name: str = "hfl/chinese-macbert-base"
     max_length: int = 128
-    batch_size: int = 48
-    epochs: int = 15
-    learning_rate: float = 2.25e-5
-    weight_decay: float = 0.03
-    warmup_ratio: float = 0.05
-    warmup_steps: int = 200
-    max_grad_norm: float = 1.0
-    early_stopping_patience: int = 3
-    early_stopping_min_delta: float = 0.0005
-    label_smoothing: float = 0.05
-
+    batch_size: int = 24
+    epochs: int = 20
+    learning_rate: float = 9.0e-6
+    weight_decay: float = 0.06
+    warmup_ratio: float = 0.10
+    warmup_steps: int = 0
+    max_grad_norm: float = 0.8
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.0001
+    label_smoothing: float = 0.08
+    '''
+    128 32 20 1.1e-5 0.05 0.08 0 1.0 5 0.0002 0.05 0.9640
+    128 24 20 9.0e-6 0.06 0.10 0 0.8 5 0.0001 0.08 0.9648
+    '''
     model_output_name: str = "sentiment_train"
 
 
@@ -812,7 +815,7 @@ def finetune(base_model_path: Path, new_data_path: Path, output_dir: Path) -> Pa
 
 if __name__ == "__main__":
     # 最小可运行示例：读取 CSV 后直接执行完整训练流水线
-    csv_path = "../training_data/converted_dataset.csv"
+    csv_path = "../training_data/sentiment_converted_data.csv"
     if not Path(csv_path).exists():
         raise FileNotFoundError(f"Dataset not found: {csv_path}")
 

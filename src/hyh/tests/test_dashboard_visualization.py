@@ -120,3 +120,35 @@ def test_saved_records_total_stays_live_and_uses_real_pagination(client):
     assert len(first["items"]) == 50 and len(second["items"]) == 1
     assert {x["id"] for x in first["items"]}.isdisjoint(x["id"] for x in second["items"])
     assert "sentiment" not in first["items"][0]
+
+
+def test_ready_cache_preserves_contract_and_force_recomputes(client, monkeypatch):
+    seed(client, 5)
+    monkeypatch.setattr(api, "_execute_lsj_pipeline", pipeline())
+    first = get_analysis(client).json()
+    assert first["analysis_status"] == "ready" and first["cached"] is False
+
+    def fail(_rows):
+        return {"ok": False, "warning": "synthetic pipeline outage", "input_count": 5}
+
+    monkeypatch.setattr(api, "_execute_lsj_pipeline", fail)
+    cached = get_analysis(client).json()
+    assert cached["cached"] is True and cached["analysis_status"] == "ready"
+    assert cached["window"]["available_count"] == 5
+    assert cached["category_counts"] == first["category_counts"]
+
+    fresh = get_analysis(client, force=True).json()
+    assert fresh["cached"] is False and fresh["analysis_status"] == "unavailable"
+    assert fresh["global"]["time_series"] == []
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT status FROM analysis_jobs ORDER BY id DESC LIMIT 1").fetchone()[0] == api.JOB_FAILED
+
+
+def test_failed_analysis_does_not_prevent_recovery_via_cache(client, monkeypatch):
+    seed(client, 5)
+    monkeypatch.setattr(api, "_execute_lsj_pipeline", lambda rows: {"ok": False, "warning": "synthetic outage"})
+    assert get_analysis(client).json()["analysis_status"] == "unavailable"
+    monkeypatch.setattr(api, "_execute_lsj_pipeline", pipeline())
+    recovered = get_analysis(client).json()
+    assert recovered["analysis_status"] == "ready"
+    assert recovered["cached"] is False

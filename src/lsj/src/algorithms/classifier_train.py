@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -126,16 +126,16 @@ def ensure_model_cached(model_name_or_path: str) -> str:
 @dataclass
 class TransformerTrainingConfig:
     """Transformer 分类训练配置。"""
-    pretrained_model_name: str = "xlm-roberta-large"
-    output_dir: str = str(Path(__file__).parent / "models" / "classifier_xlm_roberta")
-    max_length: int = 128
-    train_batch_size: int = 4
-    eval_batch_size: int = 8
-    learning_rate: float = 1e-5
+    pretrained_model_name: str = "xlm-roberta-base"
+    output_dir: str = str(Path(__file__).parent / "models" / "classifier_xlm_roberta_base")
+    max_length: int = 96
+    train_batch_size: int = 16
+    eval_batch_size: int = 16
+    learning_rate: float = 1.5e-5
     weight_decay: float = 0.01
-    num_epochs: int = 50
-    warmup_ratio: float = 0.1
-    gradient_accumulation_steps: int = 1
+    num_epochs: int = 20
+    warmup_ratio: float = 0.06
+    gradient_accumulation_steps: int = 4
     random_seed: int = 42
     val_size: float = 0.1
     test_size: float = 0.15
@@ -143,12 +143,14 @@ class TransformerTrainingConfig:
     use_fp16: bool = True
     balance_strategy: str = "upsample"
     min_length: int = 3
-    monitor: str = "val_loss"
-    early_stopping_patience: int = 5
-    early_stopping_mode: str = "min"
+    monitor: str = "val_macro_f1"
+    early_stopping_patience: int = 3
+    early_stopping_mode: str = "max"
     restore_best_weights: bool = True
-    early_stopping_min_delta: float = 1e-4
-
+    early_stopping_min_delta: float = 2e-5
+    # 历史实验记录：
+    # base + downsample ≈ 86.92%
+    # base + upsample ≈ 96.14%
 
 class TextClassificationDataset(Dataset):
     """将原始文本与标签包装为可供 DataLoader 使用的数据集。"""
@@ -202,12 +204,12 @@ class TransformerTrainer:
             raise ValueError("gradient_accumulation_steps 必须大于 0")
         if config.max_length <= 0:
             raise ValueError("max_length 必须大于 0")
-        if config.monitor != "val_loss":
-            raise ValueError("当前仅支持 monitor='val_loss'")
+        if config.monitor not in {"val_loss", "val_macro_f1"}:
+            raise ValueError("当前仅支持 monitor='val_loss' 或 monitor='val_macro_f1'")
         if config.early_stopping_patience <= 0:
             raise ValueError("early_stopping_patience 必须大于 0")
-        if config.early_stopping_mode != "min":
-            raise ValueError("当前仅支持 early_stopping_mode='min'")
+        if config.early_stopping_mode not in {"min", "max"}:
+            raise ValueError("early_stopping_mode 仅支持 'min' 或 'max'")
 
         self.config = config
         self.label2id = label2id
@@ -310,8 +312,10 @@ class TransformerTrainer:
             num_training_steps=total_train_steps,
         )
 
+        best_monitor_value = float("inf") if self.config.early_stopping_mode == "min" else float("-inf")
         best_val_loss = float("inf")
         best_val_accuracy = 0.0
+        best_val_macro_f1 = 0.0
         best_metrics: Dict[str, float] = {}
         best_state_dict = None
         epochs_without_improvement = 0
@@ -358,24 +362,31 @@ class TransformerTrainer:
             val_metrics = self.evaluate(val_loader)
 
             logger.info(
-                "Epoch %d/%d - train_loss: %.4f - val_loss: %.4f - val_acc: %.4f",
+                "Epoch %d/%d - train_loss: %.4f - val_loss: %.4f - val_acc: %.4f - val_macro_f1: %.4f",
                 epoch + 1,
                 self.config.num_epochs,
                 avg_train_loss,
                 val_metrics["loss"],
                 val_metrics["accuracy"],
+                val_metrics["macro_f1"],
             )
 
-            current_val_loss = val_metrics["loss"]
-            improved = current_val_loss < (best_val_loss - self.config.early_stopping_min_delta)
+            current_monitor_value = val_metrics["loss"] if self.config.monitor == "val_loss" else val_metrics["macro_f1"]
+            if self.config.early_stopping_mode == "min":
+                improved = current_monitor_value < (best_monitor_value - self.config.early_stopping_min_delta)
+            else:
+                improved = current_monitor_value > (best_monitor_value + self.config.early_stopping_min_delta)
 
             if improved:
-                best_val_loss = current_val_loss
+                best_monitor_value = current_monitor_value
+                best_val_loss = val_metrics["loss"]
                 best_val_accuracy = val_metrics["accuracy"]
+                best_val_macro_f1 = val_metrics["macro_f1"]
                 best_metrics = {
                     "train_loss": avg_train_loss,
                     "val_loss": val_metrics["loss"],
                     "val_accuracy": val_metrics["accuracy"],
+                    "val_macro_f1": val_metrics["macro_f1"],
                     "best_epoch": epoch + 1,
                 }
                 # 提前缓存最佳权重，便于早停后恢复到验证集表现最好的时刻。
@@ -384,32 +395,42 @@ class TransformerTrainer:
                     for key, value in self.model.state_dict().items()
                 }
                 epochs_without_improvement = 0
-                logger.info("val_loss improved to %.4f at epoch %d", best_val_loss, epoch + 1)
+                logger.info(
+                    "%s improved to %.4f at epoch %d",
+                    self.config.monitor,
+                    best_monitor_value,
+                    epoch + 1,
+                )
             else:
                 epochs_without_improvement += 1
                 logger.info(
-                    "val_loss did not improve for %d/%d epoch(s)",
+                    "%s did not improve for %d/%d epoch(s)",
+                    self.config.monitor,
                     epochs_without_improvement,
                     self.config.early_stopping_patience,
                 )
 
                 if epochs_without_improvement >= self.config.early_stopping_patience:
                     logger.info(
-                        "Early stopping triggered at epoch %d because val_loss did not improve for %d consecutive epochs",
+                        "Early stopping triggered at epoch %d because %s did not improve for %d consecutive epochs",
                         epoch + 1,
+                        self.config.monitor,
                         self.config.early_stopping_patience,
                     )
                     break
 
         if self.config.restore_best_weights and best_state_dict is not None:
             self.model.load_state_dict(best_state_dict)
-            logger.info("已恢复验证损失最低时的模型权重")
+            logger.info("已恢复早停监控指标最佳时的模型权重")
 
         logger.info(
-            "最佳验证结果 - epoch: %s, val_loss: %.4f, val_acc: %.4f",
+            "最佳验证结果 - epoch: %s, %s: %.4f, val_loss: %.4f, val_acc: %.4f, val_macro_f1: %.4f",
             best_metrics.get("best_epoch", "N/A"),
+            self.config.monitor,
+            best_monitor_value,
             best_val_loss,
             best_val_accuracy,
+            best_val_macro_f1,
         )
         return best_metrics
 
@@ -431,7 +452,8 @@ class TransformerTrainer:
 
         avg_loss = total_loss / max(1, len(dataloader))
         accuracy = accuracy_score(references, predictions) if references else 0.0
-        return {"loss": avg_loss, "accuracy": accuracy}
+        macro_f1 = f1_score(references, predictions, average="macro", zero_division=0) if references else 0.0
+        return {"loss": avg_loss, "accuracy": accuracy, "macro_f1": macro_f1}
 
     @torch.no_grad()
     def predict(self, data: List[Dict[str, str]]) -> Tuple[List[str], List[float]]:
@@ -859,11 +881,38 @@ def step8_balance_data(data, strategy="downsample"):
         return data
 
 
-def load_and_prepare_data(data_path, min_length=3, balance_strategy="downsample"):
+def _format_label_distribution(label_counts: Counter) -> str:
+    """将标签分布格式化为紧凑可读的日志字符串。"""
+    if not label_counts:
+        return "{}"
+    return "{" + ", ".join(
+        f"{label}: {count}" for label, count in sorted(label_counts.items())
+    ) + "}"
+
+
+def _log_distribution_comparison(
+    title: str,
+    before_counts: Counter,
+    after_counts: Counter,
+) -> None:
+    """打印重采样前后的标签分布对比。"""
+    labels = sorted(set(before_counts) | set(after_counts))
+    logger.info(title)
+    logger.info("  %-20s %10s %10s %10s", "label", "before", "after", "delta")
+    for label in labels:
+        before = before_counts.get(label, 0)
+        after = after_counts.get(label, 0)
+        delta = after - before
+        logger.info("  %-20s %10d %10d %+10d", label, before, after, delta)
+
+
+
+def load_and_prepare_data(data_path, min_length=3):
     """
     按既定清洗流程加载并标准化训练数据。
 
-    返回结果统一为 {"text": ..., "label": ...} 结构，便于后续训练流程直接消费。
+    仅执行基础清洗（格式化、短文本过滤、去重），不在此阶段做重采样。
+    返回结果统一为 {"text": ..., "label": ...} 结构，便于后续先划分再采样。
     """
     logger.info("=" * 60)
     logger.info("开始完整数据清洗流程")
@@ -893,7 +942,6 @@ def load_and_prepare_data(data_path, min_length=3, balance_strategy="downsample"
 
         cleaned_data = step6_remove_short_texts(formatted_data, min_length=min_length)
         cleaned_data = step7_remove_duplicates(cleaned_data)
-        cleaned_data = step8_balance_data(cleaned_data, strategy=balance_strategy)
 
         final_data = []
         for item in cleaned_data:
@@ -924,6 +972,7 @@ def create_stratified_splits(
     test_size: float = 0.15,
     val_size: float = 0.1,
     random_seed: int = 42,
+    train_balance_strategy: Optional[str] = None,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
     logger.info("划分数据集（test_size=%s, val_size=%s）", test_size, val_size)
 
@@ -981,6 +1030,27 @@ def create_stratified_splits(
         logger.info("验证集: %d 条", len(val_data))
         logger.info("测试集: %d 条", len(test_data))
 
+        train_counts_before_balance = Counter(item["label"] for item in train_data)
+        val_counts = Counter(item["label"] for item in val_data)
+        test_counts = Counter(item["label"] for item in test_data)
+
+        logger.info("划分后各集合原始标签分布:")
+        logger.info("  train: %s", _format_label_distribution(train_counts_before_balance))
+        logger.info("  val: %s", _format_label_distribution(val_counts))
+        logger.info("  test: %s", _format_label_distribution(test_counts))
+
+        if train_balance_strategy:
+            logger.info("仅对训练集执行重采样，策略: %s", train_balance_strategy)
+            train_data = step8_balance_data(train_data, strategy=train_balance_strategy)
+            train_counts_after_balance = Counter(item["label"] for item in train_data)
+            _log_distribution_comparison(
+                "训练集重采样前后标签分布对比:",
+                train_counts_before_balance,
+                train_counts_after_balance,
+            )
+        else:
+            logger.info("训练集不执行重采样，验证集和测试集保持原始分布")
+
         return train_data, val_data, test_data
 
     except Exception:
@@ -998,6 +1068,22 @@ def build_label_mappings(data: List[Dict[str, str]]) -> Tuple[Dict[str, int], Di
     id2label = {idx: label for label, idx in label2id.items()}
     logger.info("标签映射: %s", label2id)
     return label2id, id2label
+
+
+def save_error_samples(errors: List[Dict[str, object]], output_path: str) -> None:
+    """将全部误判样本保存到 JSON 文件，便于后续人工复核和重新标注。"""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "total_errors": len(errors),
+        "samples": errors,
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    logger.info("全部错误样本已保存到: %s", path)
 
 
 def train_transformer_model(
@@ -1033,7 +1119,11 @@ def train_transformer_model(
         sys.exit(1)
 
 
-def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str, str]]):
+def evaluate_on_test_set(
+    classifier: ContentClassifier,
+    test_data: List[Dict[str, str]],
+    error_output_path: Optional[str] = None,
+):
     """
     在测试集上评估模型。
 
@@ -1068,19 +1158,20 @@ def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str
                 logger.info("  %s", line)
 
         errors = []
-        for true_label, pred_label, text, confidence in zip(
-            test_labels,
-            predictions,
-            test_texts,
-            confidences,
+        for index, (true_label, pred_label, text, confidence) in enumerate(
+            zip(test_labels, predictions, test_texts, confidences),
+            start=1,
         ):
             if true_label != pred_label:
                 errors.append(
                     {
+                        "sample_id": index,
                         "text": text,
                         "true": true_label,
                         "pred": pred_label,
                         "confidence": confidence,
+                        "manual_label": "",
+                        "note": "",
                     }
                 )
 
@@ -1097,6 +1188,11 @@ def evaluate_on_test_set(classifier: ContentClassifier, test_data: List[Dict[str
                     err["pred"],
                     err["confidence"],
                 )
+
+            if error_output_path:
+                save_error_samples(errors, error_output_path)
+        elif error_output_path:
+            save_error_samples(errors, error_output_path)
 
         return {
             "accuracy": test_acc,
@@ -1126,7 +1222,7 @@ def main():
         set_seed(config.random_seed)
 
         logger.info("=" * 60)
-        logger.info("Transformer 文本分类训练 - 基于 xlm-roberta-large")
+        logger.info("Transformer 文本分类训练 - 基于 xlm-roberta-base")
         logger.info("=" * 60)
         logger.info("训练配置: %s", asdict(config))
 
@@ -1134,7 +1230,6 @@ def main():
         clean_data = load_and_prepare_data(
             data_path,
             min_length=config.min_length,
-            balance_strategy=config.balance_strategy,
         )
 
         logger.info("步骤 2: 划分训练/验证/测试集")
@@ -1143,6 +1238,7 @@ def main():
             test_size=config.test_size,
             val_size=config.val_size,
             random_seed=config.random_seed,
+            train_balance_strategy=config.balance_strategy,
         )
 
         logger.info("步骤 3: Transformer 训练")
@@ -1153,7 +1249,12 @@ def main():
         )
 
         logger.info("步骤 4: 测试集评估")
-        test_results = evaluate_on_test_set(classifier, test_data)
+        error_output_path = str(Path(config.output_dir) / "error_samples.json")
+        test_results = evaluate_on_test_set(
+            classifier,
+            test_data,
+            error_output_path=error_output_path,
+        )
 
         logger.info("=" * 60)
         logger.info("训练总结")
@@ -1161,7 +1262,9 @@ def main():
         logger.info("训练损失: %.4f", train_metrics.get("train_loss", 0.0))
         logger.info("验证损失: %.4f", train_metrics.get("val_loss", 0.0))
         logger.info("验证准确率: %.4f", train_metrics.get("val_accuracy", 0.0))
+        logger.info("验证 Macro-F1: %.4f", train_metrics.get("val_macro_f1", 0.0))
         logger.info("测试集准确率: %.4f", test_results["accuracy"])
+        logger.info("错误样本文件: %s", error_output_path)
         logger.info("模型目录: %s", config.output_dir)
         logger.info("=" * 60)
 

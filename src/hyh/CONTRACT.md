@@ -66,11 +66,14 @@ Backend normalization:
 - `GET /dashboard/summary`
   - latest daily aggregate snapshot
 
-- `GET /dashboard/visualization?days=7&from_ts=&to_ts=&limit_rows=5000`
+- `GET /dashboard/visualization?days=7&from_ts=&to_ts=&limit_rows=5000&force=false`
   - on-demand visualization payload for frontend charts
   - loads raw items in the requested time window, runs `lsj` classify/sentiment/similarity/evaluator pipeline,
     and returns chart-ready global + category time series
   - `from_ts` / `to_ts` are optional Unix epoch milliseconds; if omitted, backend uses `days`
+  - `force=true` bypasses the cache; the dashboard uses it for every explicit analysis request
+  - cache keys carry visualization schema version 2 so pre-status-contract payloads are not reused; only ready results without warnings are reusable
+  - a cached response retains its original window and generation timestamp; use `force=true` for a fresh rolling window
   - response shape:
     - `window`
       - `from_ts`, `to_ts`, `limit_rows`, `input_count`
@@ -137,6 +140,7 @@ Backend normalization:
 - The dashboard reads live saved-record counts from `GET /items`, independently of analysis.
 - Saved items are deduplicated pages, not visit events or measured reading duration.
 - The dashboard requests visualization only on explicit user action. It displays the result as an experimental snapshot.
+- Visualization failures/unavailability are recorded as failed jobs, not successful measurements; `/analyze/run_full` retains its separate legacy behavior.
 - Missing dates/metrics are unknown values, not zero. Zero proportions are valid observations.
 - Existing `/analyze/run`, `/analyze/run_full` and `/dashboard/summary` retain their older behavior; their degraded metrics are not covered by the visualization status contract above. The current dashboard does not consume them.
 - Client upload payload does **not** include:

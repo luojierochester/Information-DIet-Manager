@@ -139,7 +139,7 @@ async function runAnalysis() {
   category.value = 'global'
   analysisController = new AbortController()
   try {
-    const response = await api.get('/dashboard/visualization', { params: { days: 7 }, signal: analysisController.signal })
+    const response = await api.get('/dashboard/visualization', { params: { days: 7, force: true }, signal: analysisController.signal })
     analysis.value = analysisSnapshot(response.data)
   } catch (error) {
     if (!axios.isCancel(error)) analysis.value = emptyAnalysis('request_error')

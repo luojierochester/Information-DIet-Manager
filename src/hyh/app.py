@@ -1116,7 +1116,10 @@ def import_items(file: UploadFile = File(...)) -> IngestAck:
 def list_items(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
+    limit: Optional[int] = Query(None, ge=1, le=200),
 ) -> Dict[str, Any]:
+    if limit is not None:
+        page_size = limit
     offset = (page - 1) * page_size
     with get_conn() as conn:
         total = conn.execute("SELECT COUNT(*) AS cnt FROM items").fetchone()["cnt"]
@@ -1536,10 +1539,14 @@ def get_analyze_result(job_id: int) -> Dict[str, Any]:
 @app.get("/dashboard/summary")
 def dashboard_summary() -> Dict[str, Any]:
     with get_conn() as conn:
+        item_state = conn.execute(
+            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
+        ).fetchone()
+        max_created_at = int(item_state["max_created_at"] or 0)
         row = conn.execute(
             "SELECT * FROM stats_daily ORDER BY day DESC LIMIT 1"
         ).fetchone()
-    if row:
+    if row and int(row["updated_at"] or 0) >= max_created_at:
         return _payload_from_stats_row(row)
     return run_analysis(force=False, backfill_limit=2000)
 
@@ -1551,6 +1558,7 @@ def dashboard_visualization(
     from_ts: Optional[int] = Query(None),
     to_ts: Optional[int] = Query(None),
     limit_rows: int = Query(5000, ge=1, le=50000),
+    force: bool = Query(False),
 ) -> Dict[str, Any]:
     if from_ts is not None and to_ts is not None and from_ts > to_ts:
         raise HTTPException(
@@ -1565,6 +1573,7 @@ def dashboard_visualization(
         else max(0, resolved_to_ts - days * 24 * 60 * 60 * 1000)
     )
 
+    day = datetime.now(timezone.utc).date().isoformat()
     with get_conn() as conn:
         # Keep the coverage count and selected rows in the same read snapshot.
         conn.execute("BEGIN")
@@ -1572,22 +1581,120 @@ def dashboard_visualization(
             "SELECT COUNT(*) FROM items WHERE ts >= ? AND ts <= ?",
             (resolved_from_ts, resolved_to_ts),
         ).fetchone()[0]
+        item_state = conn.execute(
+            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
+        ).fetchone()
+        max_created_at = int(item_state["max_created_at"] or 0)
         rows = _load_items_for_analysis(
             conn,
             from_ts=resolved_from_ts,
             to_ts=resolved_to_ts,
             limit_rows=limit_rows,
         )
+        input_count = len(rows)
+        job_key = {
+            "days": days,
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "limit_rows": limit_rows,
+            "mode": "dashboard_visualization",
+            "schema_version": 2,
+        }
+        input_hash = _stable_hash_payload(job_key)
 
-    result = _build_visualization_result(
-        rows,
-        from_ts=resolved_from_ts,
-        to_ts=resolved_to_ts,
-        limit_rows=limit_rows,
-    )
-    result["window"]["available_count"] = int(available_count)
-    result["window"]["truncated"] = available_count > len(rows)
-    return result
+    # Release the read snapshot before writing job/cache metadata.
+    with get_conn() as conn:
+        if not force:
+            cached = conn.execute(
+                """
+                SELECT id, result_payload FROM analysis_jobs
+                WHERE input_hash = ? AND item_max_created_at = ? AND status = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (input_hash, max_created_at, JOB_COMPLETED),
+            ).fetchone()
+            if cached:
+                cached_payload: Dict[str, Any] = {}
+                if cached["result_payload"]:
+                    try:
+                        cached_payload = json.loads(cached["result_payload"])
+                    except json.JSONDecodeError:
+                        cached_payload = {}
+                if (
+                    isinstance(cached_payload, dict)
+                    and cached_payload.get("analysis_status") == "ready"
+                    and not cached_payload.get("pipeline_warning")
+                ):
+                    job_id = _insert_analysis_job(
+                        conn,
+                        status=JOB_COMPLETED,
+                        input_hash=input_hash,
+                        day=day,
+                        from_ts=resolved_from_ts,
+                        to_ts=resolved_to_ts,
+                        limit_rows=limit_rows,
+                        item_max_created_at=max_created_at,
+                        input_count=input_count,
+                        cache_hit=True,
+                    )
+                    _update_analysis_job(
+                        conn,
+                        job_id,
+                        status=JOB_COMPLETED,
+                        result_payload=cached_payload,
+                        metrics_json={
+                            "cache_reuse_from_job_id": int(cached["id"]),
+                            "input_count": input_count,
+                            "cache_hit": True,
+                            "mode": "dashboard_visualization",
+                        },
+                        duration_ms=0,
+                        started_at=_now_ms(),
+                        finished_at=_now_ms(),
+                    )
+                    cached_payload["cached"] = True
+                    cached_payload["reused_from_job_id"] = int(cached["id"])
+                    return cached_payload
+
+        job_id = _insert_analysis_job(
+            conn,
+            status=JOB_RUNNING,
+            input_hash=input_hash,
+            day=day,
+            from_ts=resolved_from_ts,
+            to_ts=resolved_to_ts,
+            limit_rows=limit_rows,
+            item_max_created_at=max_created_at,
+            input_count=input_count,
+            cache_hit=False,
+        )
+        started_at = _now_ms()
+        payload = _build_visualization_result(
+            rows,
+            from_ts=resolved_from_ts,
+            to_ts=resolved_to_ts,
+            limit_rows=limit_rows,
+        )
+        payload["window"]["available_count"] = int(available_count)
+        payload["window"]["truncated"] = available_count > len(rows)
+        payload["cached"] = False
+        _update_analysis_job(
+            conn,
+            job_id,
+            status=JOB_FAILED if payload["analysis_status"] in {"failed", "unavailable"} else JOB_COMPLETED,
+            result_payload=payload,
+            metrics_json={
+                "input_count": input_count,
+                "cache_hit": False,
+                "mode": "dashboard_visualization",
+                "pipeline_warning": payload.get("pipeline_warning"),
+            },
+            duration_ms=_now_ms() - started_at,
+            started_at=started_at,
+            finished_at=_now_ms(),
+        )
+        return payload
 
 
 @app.get("/export/lsj")
