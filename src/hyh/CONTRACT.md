@@ -8,14 +8,18 @@
 ## 2. Data Model (Minimum Viable)
 ### 2.1 `items` (raw records)
 Required fields:
-- `url`: string, valid URL
-- `title`: string, non-empty
-- `ts`: integer, Unix epoch milliseconds
+- `url`: HTTP/HTTPS URL, at most 2048 characters
+- `title`: string, trimmed before validation; 1 to 300 characters after trimming
+- `ts`: strict integer Unix epoch milliseconds, from `0` through `253402300799999` (year 9999); strings, booleans and floats are invalid for `/collect`
 - `source`: `plugin | import`
 
 Optional fields:
-- `text`: string (if empty, backend falls back to `title`)
-- `lang`, `channel`, `author`, `tags`, `meta`
+- `text`: string, at most 2000 characters (if empty, backend falls back to `title`)
+- `lang`, `channel`, `author`: strings of at most 16, 32 and 120 characters respectively
+- `tags`: at most 10 strings, at most 40 characters each
+- `meta`: object containing only JSON values and string keys, with at most 8 nested object/array levels (root object is level 1); finite numbers only. Its compact JSON serialization with literal Unicode must fit in 8192 UTF-8 bytes
+- optional fields may be omitted or `null`; unknown top-level properties are ignored for compatibility
+- string limits count Unicode code points; `meta` has a byte limit instead. Strings must be valid Unicode encodable as UTF-8; lone surrogate escapes are rejected, while valid pairs such as emoji are accepted
 
 Backend normalization:
 - `text` empty -> fallback to `title`
@@ -49,11 +53,19 @@ Backend normalization:
 ### 3.1 Ingestion
 - `POST /collect`
   - body: single `IngestItem`
-  - response: `{"inserted": n, "duplicates": m, "failed": 0}`
+  - successful response is exactly one of `{"inserted": 1, "duplicates": 0, "failed": 0}` or `{"inserted": 0, "duplicates": 1, "failed": 0}`
+  - acknowledgement is returned only after the database transaction commits; storage errors must not be acknowledged as success
+  - retry after a lost response is safe under the existing normalized-URL unique constraint: a previously committed page returns `duplicates: 1`
+  - `duplicates` means the page URL already exists, not that a new visit or updated title/text was saved; repeated URLs retain their original record
+  - clients may remove a queued record only after validating non-negative integer acknowledgement fields, `failed == 0`, and `inserted + duplicates == 1`; HTTP 2xx alone is insufficient
+  - schema validation failures return `422`. Keep rejected records available for inspection/correction; do not silently drop them or continuously retry an unchanged invalid payload
+  - validation error entries contain only `type`, `loc` and `msg`; they do not echo request values or exception contexts. Invalid metadata such as non-finite numbers or lone surrogate escapes is also rejected as `422`
 
 - `POST /import`
   - body: `multipart/form-data` file (`csv/json/jsonl`)
   - response: `{"inserted": n, "duplicates": m, "failed": k}`
+  - each parsed item uses the same field limits; invalid items contribute to `failed`. The import parser retains its legacy conversion of textual timestamps before model validation
+  - a storage failure rolls back the entire insert transaction, including earlier valid rows and their embeddings; it does not return a partial-success acknowledgement
 
 - `GET /items?page=1&page_size=20`
   - list stored raw items
@@ -152,7 +164,8 @@ Backend normalization:
 - cache events are recorded in `analysis_jobs` (`cache_hit = 1`)
 
 ## 6. Error Contract
-- invalid input -> `400`
+- invalid `/collect` request fields -> `422`; malformed/unsupported import files -> `400`
 - job not found -> `404`
 - result requested before completion -> `409`
-- pipeline/internal failure -> `500` with `job_id` in detail
+- storage failure during ingestion -> `500`, without a successful acknowledgement; only normalized-URL uniqueness conflicts count as duplicates, other database constraint failures do not
+- pipeline/internal failure -> `500` with `job_id` in detail where the analysis job endpoint supplies one

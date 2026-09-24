@@ -16,7 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import Response, StreamingResponse
 
 from .db import get_conn, init_db
 from .models import IngestAck, IngestItem
@@ -753,13 +754,13 @@ def insert_items(items: Iterable[IngestItem]) -> Tuple[int, int]:
     inserted = 0
     duplicates = 0
     sql = """
-        INSERT OR IGNORE INTO items (
+        INSERT INTO items (
             url, title, text, ts, source, lang, channel, author, tags, meta,
             url_hash, content_hash, created_at
         ) VALUES (
             :url, :title, :text, :ts, :source, :lang, :channel, :author, :tags, :meta,
             :url_hash, :content_hash, :created_at
-        )
+        ) ON CONFLICT(url_hash) DO NOTHING
     """
     with get_conn() as conn:
         for item in items:
@@ -1067,6 +1068,15 @@ app = FastAPI(
     title="Information Diet Manager (MVP)",
     lifespan=lifespan,  # 关键：把生命周期函数关联到 app
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_request, exc: RequestValidationError):
+    # Do not echo page text, invalid JSON values or exception contexts from a request.
+    details = [{"type": error["type"], "loc": error["loc"], "msg": error["msg"]}
+               for error in exc.errors()]
+    return Response(json.dumps({"detail": details}, ensure_ascii=True),
+                    status_code=422, media_type="application/json")
+
 
 app.add_middleware(
     CORSMiddleware,
