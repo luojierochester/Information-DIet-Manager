@@ -74,6 +74,21 @@ Backend normalization:
   - response shape:
     - `window`
       - `from_ts`, `to_ts`, `limit_rows`, `input_count`
+      - `available_count`: all saved records in the requested window, counted in the same SQLite read snapshot
+      - `truncated`: true when the window contains more records than were loaded
+      - `processed_count`: valid rows after preprocessing, present on a ready response
+      - selection remains ascending by timestamp; a truncated result is the earliest portion, not a representative sample
+    - `analysis_status`: `empty | insufficient_data | unavailable | failed | ready`
+      - `empty`: no input records in the requested window
+      - `insufficient_data`: fewer than `minimum_records` input records; optional model dependencies are not loaded
+      - `unavailable`: the pipeline could not run (dependency/configuration/runtime failure)
+      - `failed`: visualization postprocessing failed
+      - `ready`: chart data was produced; this does not certify model accuracy
+      - non-ready responses contain empty chart collections, never invented neutral/zero measurements
+    - `minimum_records`: currently 5, an implementation guard matching the default evaluator; not a scientifically validated sample-size requirement
+    - `date_timezone`: currently `UTC`; a rolling seven-day window can intersect eight calendar dates
+    - `category_counts`: absolute counts from the same preprocessed sample as the daily series
+      - retains `shopping` and `tools` as separate categories
     - `global`
       - `time_series`: `[{date, count, avg_polarity, avg_similarity, repeat_ratio, negative_ratio, positive_ratio, neutral_ratio}]`
       - `category_distribution`, `sentiment_distribution`, `similarity_histogram`, `hourly_distribution`
@@ -91,7 +106,7 @@ Backend normalization:
     - `category_aliases`
       - same mapping table for client-side lookup
     - `pipeline_warning`
-      - present when `lsj` dependencies are unavailable and payload is degraded
+      - diagnostic warning for unavailable/failed analysis; clients must not treat it as a successful measurement
     - `generated_at`
 
 - `GET /analyze/history?limit=20`
@@ -119,6 +134,11 @@ Backend normalization:
   - completed job result payload
 
 ## 4. Important Clarification
+- The dashboard reads live saved-record counts from `GET /items`, independently of analysis.
+- Saved items are deduplicated pages, not visit events or measured reading duration.
+- The dashboard requests visualization only on explicit user action. It displays the result as an experimental snapshot.
+- Missing dates/metrics are unknown values, not zero. Zero proportions are valid observations.
+- Existing `/analyze/run`, `/analyze/run_full` and `/dashboard/summary` retain their older behavior; their degraded metrics are not covered by the visualization status contract above. The current dashboard does not consume them.
 - Client upload payload does **not** include:
   - `category`, `sentiment`, `polarity`, `similarity`
 - These are derived fields generated inside analysis pipeline before evaluator.

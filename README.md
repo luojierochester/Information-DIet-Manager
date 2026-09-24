@@ -1,104 +1,89 @@
-# Information-DIet-Manager
+# Information Diet Manager
 
-2Manage the information you take in every day just like you manage your diet.
+本地页面记录与实验性文本统计工具。当前面向 **Windows + Chrome、每位用户在自己的电脑运行**，仍处于开发阶段。
 
-You can define your own database location by setting the IDM_DB_PATH environment variable, otherwise the database location will be created in this directory.
+目前可以接收扩展或导入数据、保存到 SQLite、分页查看已保存记录，并按需尝试文本分类、情感标签和相邻文本相似度分析。实验结果没有经过足以支持“健康等级”“心理状态”或“信息茧房诊断”的验证。
 
-## 项目简介
+## 当前界面与数据口径
 
-Information Diet Manager 是一个用于评估用户“信息茧房”程度的工具。它支持多种数据采集方式，包括网站后端数据抓取和 Chrome 浏览器插件自动采集用户浏览信息。通过分析用户的浏览行为和内容分布，帮助用户了解自身的信息摄入多样性和偏向性。
-
-## 主要功能
-
-- 数据模型与数据库结构定义（src/hyh/）
-- 主程序与数据分析逻辑（src/lsj/src/main.py）
-- 数据抓取工具（src/lsj/src/utils/fetch_data.py）
-- Chrome 插件采集用户浏览信息（url、标题、meta、正文、停留时长等）
-- 后端 API 接收并存储浏览数据
-- 信息茧房程度评估与分析
+- **已保存记录**：实时读取 `/items`，每页 50 条，可加载更多。记录按页面去重，不等于访问次数、精确阅读时长或完整浏览历史。
+- **近 7 天实验分析**：只有点击按钮才请求 `/dashboard/visualization?days=7`。分析范围是最近 7×24 小时，日趋势按 UTC；时间窗口可能跨 8 个日历日期。
+- **明确状态**：没有数据、样本不足、分析不可用、分析失败分别显示。缺失指标不补零，不生成固定评分、处方或虚构逐条情感标签。
+- **快照与覆盖范围**：图表来自同一次分析；新记录不会自动加入。超过分析行数上限时提示只读取最早的一部分。
+- **最低样本量**：目前为 5 条，这是与默认评估器一致的运行门槛，不代表统计充分性或模型准确性保证。
 
 ## 项目结构
 
-```
-Information-DIet-Manager/
-├── README.md
-├── src/
-│   ├── hyh/                        # 后端服务（FastAPI + SQLite）
-│   │   ├── CONTRACT.md             # 接口与约定说明
-│   │   ├── import_formats.md       # 数据导入格式说明
-│   │   ├── ingest_item.schema.json # 数据结构定义（JSON Schema）
-│   │   ├── models.py               # Pydantic 数据模型
-│   │   ├── schema.sql              # 数据库表结构
-│   │   ├── app.py                  # FastAPI 应用（API 路由）
-│   │   ├── db.py                   # 数据库连接管理
-│   │   └── utils.py                # URL/文本规范化与哈希
-│   ├── lsj/                        # 本地数据抓取与分析
-│   │   ├── requirements.txt        # 依赖库
-│   │   └── src/
-│   │       ├── main.py             # 主程序入口
-│   │       └── utils/
-│   │           └── fetch_data.py   # Chrome 本地历史记录抓取
-│   └── chrome-extension/           # Chrome 浏览器插件
-│       ├── manifest.json           # 插件清单（Manifest V3）
-│       ├── background.js           # Service Worker：停留时长追踪与数据上传
-│       ├── content.js              # Content Script：提取页面元信息与正文
-│       ├── popup.html              # 插件弹窗界面
-│       └── popup.js                # 弹窗交互逻辑（API 地址配置、开关）
+```text
+chrome-extension/             Chrome Manifest V3 扩展
+frontend/                     Vue 3 + Vite + ECharts 界面
+  src/dashboard-data.js       响应校验、日期对齐与指标转换
+  tests/                      前端行为测试
+src/hyh/                      FastAPI + Pydantic + SQLite
+  app.py                      接收、查询与分析编排
+  CONTRACT.md                 API 契约及当前限制
+  tests/                      隔离 SQLite 的 HTTP 契约测试
+src/lsj/                      数据获取、分类、情感、相似度和评估代码
+  requirements.txt            实验分析依赖清单（尚未完整锁定或验证）
+docs/                         审查记录与分轮改进说明
 ```
 
-## Chrome 插件集成说明
+## 本地开发启动（PowerShell）
 
-1. 用户安装 Chrome 插件后，插件会自动采集浏览信息（包括 url、标题、meta description、正文、停留时长等）。
-2. 插件将采集到的数据通过 HTTP POST 上传到后端 API（`/collect`），数据格式遵循 `IngestItem` 契约。
-3. 后端接收数据并存储到数据库，后续可通过 `/analyze/run` 和 `/dashboard/summary` 进行信息茧房程度分析。
+下面先启动记录存储与界面，不要求下载机器学习模型。本轮验证环境为 Python 3.12、Node.js 24、Windows 和 Chrome；尚未建立完整版本兼容矩阵。
 
-### 安装 Chrome 插件
+从项目根目录执行：
 
-1. 启动后端服务：`python src/hyh/app.py`
-2. 打开 Chrome 浏览器，进入 `chrome://extensions/`
-3. 打开右上角 **开发者模式**
-4. 点击 **加载已解压的扩展程序**，选择 `src/chrome-extension/` 目录
-5. 插件安装完成后，点击工具栏图标可配置后端 API 地址和采集开关
-6. 正常浏览网页即可，插件会自动采集并上传浏览数据
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install fastapi uvicorn pydantic python-multipart
 
-### 插件工作原理
+# 使用个人数据目录，避免写入仓库随附的数据库
+$dataDir = Join-Path $env:LOCALAPPDATA 'InformationDietManager'
+New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+$env:IDM_DB_PATH = Join-Path $dataDir 'idm.sqlite3'
+.\.venv\Scripts\python.exe -m uvicorn src.hyh.app:app --host 127.0.0.1 --port 8000
+```
 
-- **background.js (Service Worker)**：监听标签页切换和关闭事件，计算每个页面的停留时长，将数据发送到后端 `/collect` 接口
-- **content.js (Content Script)**：在页面加载完成后提取 meta description 或正文摘要（截取前 2000 字符），发送给 Service Worker
-- **popup.html / popup.js**：提供简单的配置界面，用户可设置后端 API 地址和启用/禁用数据采集
-- 忽略停留时间小于 2 秒的页面访问，以减少噪声数据
-- 仅采集 HTTP/HTTPS 页面，不采集浏览器内部页面
+另开终端启动前端：
 
-## 技术栈
+```powershell
+cd frontend
+npm ci
+npm run dev -- --host 127.0.0.1
+```
 
-- Python（后端与数据分析）
-- Chrome Extension（前端数据采集）
-- RESTful API（数据上传与交互）
-- 数据库（结构见 schema.sql）
+打开终端打印的前端地址。API 文档在 `http://127.0.0.1:8000/docs`。前端默认连接 `http://127.0.0.1:8000`；可参考 `frontend/.env.example` 设置 `VITE_API_BASE_URL`，修改后重启前端。
 
-## 快速开始
+`IDM_DB_PATH` 的父目录必须已存在。不设置该变量时，后端默认使用 `src/hyh/data/idm.sqlite3`。仓库目前仍跟踪该数据库，移除随附数据属于后续仓库清理工作。
 
-1. 安装后端依赖：
-   ```cmd
-   pip install fastapi uvicorn pydantic
-   ```
-2. 启动后端服务：
-   ```cmd
-   uvicorn src.hyh.app:app --reload --port 8000
-   ```
-3. 安装 Chrome 插件：
-   - 打开 `chrome://extensions/`，开启开发者模式
-   - 点击"加载已解压的扩展程序"，选择 `src/chrome-extension/` 目录
-4. 浏览网页，插件自动采集并上传数据
-5. 访问 `http://127.0.0.1:8000/docs` 查看 API 文档
-6. 调用 `POST /analyze/run` 运行分析，调用 `GET /dashboard/summary` 查看信息茧房评估结果
+### Chrome 扩展
 
-## 安全与隐私
+打开 `chrome://extensions/`，开启开发者模式，选择“加载已解压的扩展程序”，加载项目根目录的 **`chrome-extension/`**。在弹窗中确认本地 API 地址和采集开关。
 
-- 插件采集内容仅用于信息多样性分析。本地开发默认使用 HTTP，生产环境建议配置 HTTPS 以加密传输。
-- 用户可随时卸载插件或通过弹窗界面关闭数据上传。
+扩展会读取 URL、标题及页面文本等信息。当前采集队列和重复访问的数据模型仍有已知缺陷；请先在测试页面验证，不把结果当作完整浏览历史。扩展的时长采集尚未通过准确性验收。
 
-## 贡献与开发
+### 实验分析
 
-- 欢迎提交 issue 或 pull request。
-- 新增插件或分析模块请遵循模块化设计原则。
+基础服务可以独立保存和查看记录。完整分析依赖 `src/lsj/` 中的代码、额外依赖和模型配置，目前仍存在导入及依赖问题；仅安装其 `requirements.txt` 不能视为完整推理环境已经可用。
+
+依赖缺失或分析运行失败时，界面会显示不可用/失败，保留原始记录入口。本轮没有宣称真实模型推理、训练或采集全链路已经修复。
+
+## 验证
+
+```powershell
+# 项目根目录：HTTP 契约与现有静态契约测试，无模型下载
+.\.venv\Scripts\python.exe -m pip install pytest httpx pandas
+.\.venv\Scripts\python.exe -m pytest src/hyh/tests src/lsj/tests -q
+
+# 前端目录
+cd frontend
+npm test
+npm run build
+```
+
+测试使用临时数据库。模型输出相关契约测试使用合成结果，与真实推理验收分开记录。浏览器验证与本轮边界见 [第一轮改进记录](docs/round-1-improvements.md)。
+
+## 当前发布边界
+
+当前是本地开发预览，尚未达到企业级发布标准。采集可靠性、重复访问保留、隐私控制、接口访问保护、模型可运行性、依赖锁定和持续集成仍需逐轮完善。旧 `/analyze/run`、`/analyze/run_full`、`/dashboard/summary` 仍保留原有语义，本轮前端已停止使用这些接口作为展示依据。

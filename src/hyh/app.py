@@ -35,6 +35,7 @@ JOB_RUNNING = "running"
 JOB_COMPLETED = "completed"
 JOB_FAILED = "failed"
 DEFAULT_VIS_DAYS = 7
+MIN_VIS_RECORDS = 5
 DEFAULT_REPEAT_THRESHOLD = 0.85
 CATEGORY_ALIAS_MAP = {
     "entertainment": "ent",
@@ -358,6 +359,10 @@ def _default_visualization_result(
         "global": _default_visualization_payload(),
         "categories": {},
         "category_aliases": aliases,
+        "category_counts": {},
+        "analysis_status": "not_computed",
+        "minimum_records": MIN_VIS_RECORDS,
+        "date_timezone": "UTC",
         "pipeline_warning": pipeline_warning,
         "generated_at": generated_at if generated_at is not None else _now_ms(),
     }
@@ -512,24 +517,46 @@ def _build_visualization_result(
         limit_rows=limit_rows,
         input_count=len(rows),
     )
+    if not rows:
+        base["analysis_status"] = "empty"
+        return base
+    if len(rows) < MIN_VIS_RECORDS:
+        base["analysis_status"] = "insufficient_data"
+        return base
     execution = _execute_lsj_pipeline(rows)
 
     if not execution.get("ok"):
+        base["analysis_status"] = "unavailable"
         base["pipeline_warning"] = execution.get("warning")
         return base
 
     if int(execution.get("input_count") or 0) == 0:
+        base["analysis_status"] = "empty"
         return base
 
     evaluator = execution["evaluator"]
     df3 = execution["df3"]
-    processed = evaluator._preprocess_data(df3)
-    global_payload = evaluator.get_visualization_data(df3)
-    global_payload["time_series"] = _build_daily_metric_rows(processed)
+    try:
+        processed = evaluator._preprocess_data(df3)
+        global_payload = evaluator.get_visualization_data(df3)
+        global_payload["time_series"] = _build_daily_metric_rows(processed)
+        categories = _build_category_visualization(processed)
+        category_counts = {
+            str(key): int(count)
+            for key, count in processed["category"].value_counts().items()
+        }
+    except Exception:
+        # Do not turn a failed metric computation into zeroes or a successful chart.
+        base["analysis_status"] = "failed"
+        base["pipeline_warning"] = "visualization computation failed"
+        return base
 
     base["window"]["input_count"] = int(execution["input_count"])
+    base["window"]["processed_count"] = int(len(processed))
+    base["analysis_status"] = "ready"
     base["global"] = global_payload
-    base["categories"] = _build_category_visualization(processed)
+    base["categories"] = categories
+    base["category_counts"] = category_counts
     return base
 
 
@@ -1539,6 +1566,12 @@ def dashboard_visualization(
     )
 
     with get_conn() as conn:
+        # Keep the coverage count and selected rows in the same read snapshot.
+        conn.execute("BEGIN")
+        available_count = conn.execute(
+            "SELECT COUNT(*) FROM items WHERE ts >= ? AND ts <= ?",
+            (resolved_from_ts, resolved_to_ts),
+        ).fetchone()[0]
         rows = _load_items_for_analysis(
             conn,
             from_ts=resolved_from_ts,
@@ -1546,12 +1579,15 @@ def dashboard_visualization(
             limit_rows=limit_rows,
         )
 
-    return _build_visualization_result(
+    result = _build_visualization_result(
         rows,
         from_ts=resolved_from_ts,
         to_ts=resolved_to_ts,
         limit_rows=limit_rows,
     )
+    result["window"]["available_count"] = int(available_count)
+    result["window"]["truncated"] = available_count > len(rows)
+    return result
 
 
 @app.get("/export/lsj")
