@@ -10,7 +10,8 @@ from src.hyh import db
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "dashboard.sqlite3")
-    with TestClient(api.app) as client:
+    with TestClient(api.app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000),
+                    headers={"Authorization": "Bearer " + "a" * 43}) as client:
         yield client
 
 

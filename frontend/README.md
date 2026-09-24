@@ -1,6 +1,6 @@
 # Information Diet Manager 前端
 
-Vue 3 + Vite + ECharts。本轮界面区分实时保存记录与手动运行的实验分析。
+Vue 3 + Vite + ECharts。界面区分实时保存记录与手动运行的实验分析，并通过管理密钥访问本机服务。
 
 ## 启动
 
@@ -8,10 +8,12 @@ Vue 3 + Vite + ECharts。本轮界面区分实时保存记录与手动运行的�
 
 ```powershell
 npm ci
-npm run dev -- --host 127.0.0.1
+npm run dev -- --host 127.0.0.1 --strictPort
 ```
 
-默认 API 地址为 `http://127.0.0.1:8000`。需要修改时，将 `.env.example` 复制为 `.env.local` 并修改 `VITE_API_BASE_URL`，然后重启 Vite。该地址会进入前端构建结果，不应包含密钥。
+默认 API 地址为 `http://127.0.0.1:8000`，只允许回环地址。需要修改时，将 `.env.example` 复制为 `.env.local` 并修改 `VITE_API_BASE_URL`，然后重启 Vite。该地址会进入前端构建结果，不应包含密钥。后端默认只允许界面的 HTTP 5173/4173 来源；更改前端端口须同步配置 `IDM_FRONTEND_ORIGINS`。
+
+从后端启动时提示的私有文件中复制 `admin_token` 并连接；采集密钥不能解锁管理界面。管理密钥只在页面内存中保存，刷新需重连。断开或服务拒绝认证时清空界面，丢弃在途旧响应。请求不发送 Cookie、不跟随重定向，客户端超时为 30 秒；超时并不意味着服务端操作已撤销。
 
 ## 行为
 
@@ -22,12 +24,15 @@ npm run dev -- --host 127.0.0.1
 - 分类来自同一次分析，工具和购物分别显示。分类筛选只作用于实验趋势，不筛选原始记录。
 - 原始记录没有逐条情感、访问次数和缓存状态，界面不会补造。
 - 支持中英文、深浅主题；记录弹窗支持 Escape 关闭及焦点恢复。
+- 支持下载页面记录备份、逐条/全部删除和替换恢复；破坏性操作需要界面确认。请先暂停扩展、清空待同步队列，并妥善保管明文备份。备份范围和恢复约束见根 README。
 
 ## 验证
 
 ```powershell
 npm test
 npm run build
+# 先完成根 README 中扩展测试依赖和浏览器安装，并设置 IDM_TEST_PYTHON
+npm run test:e2e
 ```
 
-`tests/dashboard-data.test.js` 验证比例、日期缺口、状态替换、分类、分页和链接协议。浏览器人工编排验证另见 `../docs/round-1-improvements.md`；这些测试不能代替真实模型与扩展验收。
+`tests/dashboard-data.test.js` 验证比例、日期缺口、状态替换、分类、分页和链接协议；`tests/local-api.test.js` 验证密钥范围、会话失效、跨域和请求边界。`tests/lifecycle.e2e.cjs` 连接真实临时 FastAPI、SQLite 与前端生产构建，验证配对、备份、删除、恢复和会话失效。所有测试使用合成记录和独立浏览器，不是模型推理验收。结果见 `../docs/round-3-improvements.md`。

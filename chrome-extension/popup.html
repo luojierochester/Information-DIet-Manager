@@ -15,6 +15,9 @@
     <p id="lastError" class="hint"></p>
   </section>
   <section class="card" aria-label="采集设置">
+    <label for="apiToken">本机采集密钥（collector_token）</label>
+    <input id="apiToken" type="password" autocomplete="off" spellcheck="false" placeholder="从本机密钥文件复制采集密钥">
+    <p class="hint">只填写采集密钥。它保存在扩展的受限存储中，不授予读取、删除或恢复数据的权限。</p>
     <label for="endpoint">本机接口地址</label>
     <input id="endpoint" type="url" placeholder="http://127.0.0.1:8000/collect">
     <p class="hint">只允许本机 /collect；修改后，现有队列也将发送到新地址。</p>

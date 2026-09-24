@@ -73,6 +73,9 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+*.credentials.json
+*.credentials.json.new
+src/hyh/data/*.lock
 
 # =========================
 # Temporary files

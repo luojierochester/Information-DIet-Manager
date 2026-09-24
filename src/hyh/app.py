@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import asyncio
 import hashlib
 import io
 import json
@@ -14,16 +15,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import Response, StreamingResponse
 
 from .db import get_conn, init_db
 from .models import IngestAck, IngestItem
 from .utils import normalize_text, normalize_url, sha256_hex
+from . import db
+from .security import LocalAccessMiddleware, LocalSecurity, process_ownership
+from .data_management import install_data_routes
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 from urllib.parse import urlparse
 
@@ -750,7 +753,7 @@ def _get_job_row(conn: Any, job_id: int) -> Optional[Dict[str, Any]]:
     return data
 
 
-def insert_items(items: Iterable[IngestItem]) -> Tuple[int, int]:
+def insert_items(items: Iterable[IngestItem], *, connection=None) -> Tuple[int, int]:
     inserted = 0
     duplicates = 0
     sql = """
@@ -762,7 +765,7 @@ def insert_items(items: Iterable[IngestItem]) -> Tuple[int, int]:
             :url_hash, :content_hash, :created_at
         ) ON CONFLICT(url_hash) DO NOTHING
     """
-    with get_conn() as conn:
+    with (get_conn() if connection is None else nullcontext(connection)) as conn:
         for item in items:
             row = _row_from_item(item)
             cur = conn.execute(sql, row)
@@ -1057,16 +1060,17 @@ def _prepare_training_rows(
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # 启动逻辑：和原来的 on_startup 完全一致
-    init_db(_schema_path())
-    yield  # 分割线：启动完成，应用开始运行
-    # 关闭逻辑（如果需要的话，比如关闭数据库连接）
-    # 示例：await db.close() （如果有异步数据库连接的话）
+    with process_ownership(db.DB_PATH):
+        _app.state.security = LocalSecurity.load(db.DB_PATH)
+        _app.state.operation_lock = asyncio.Lock()
+        _app.state.request_slots = asyncio.Semaphore(4)
+        init_db(_schema_path())
+        yield
 
 
 app = FastAPI(
     title="Information Diet Manager (MVP)",
-    lifespan=lifespan,  # 关键：把生命周期函数关联到 app
+    lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
 )
 
 @app.exception_handler(RequestValidationError)
@@ -1078,13 +1082,18 @@ async def validation_error_handler(_request, exc: RequestValidationError):
                     status_code=422, media_type="application/json")
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 允许前端请求
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(LocalAccessMiddleware)
+install_data_routes(app, insert_items)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/session")
+def session(request: Request):
+    return {"role": request.scope["idm_role"]}
 
 
 @app.post("/collect", response_model=IngestAck)

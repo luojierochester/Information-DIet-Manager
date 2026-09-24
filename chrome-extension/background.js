@@ -72,7 +72,7 @@ async function handleMessage(message, sender) {
 }
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleMessage(message, sender).then(sendResponse).catch(error => {
-    const reason = ['invalid_settings', 'invalid_endpoint', 'invalid_storage'].includes(error.code) ? error.code : 'storage_error';
+    const reason = ['invalid_settings', 'invalid_endpoint', 'invalid_storage', 'invalid_token'].includes(error.code) ? error.code : 'storage_error';
     sendResponse({ ok: false, reason });
   });
   return true;

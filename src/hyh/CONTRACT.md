@@ -50,6 +50,18 @@ Backend normalization:
 - stores input window, cache hit, duration, error, result payload
 
 ## 3. API Surface
+### 3.0 Local access boundary
+- Use the single-process loopback launcher `python scripts/run_backend.py`; the app also checks the actual peer IP, `Host`, and `Origin`. An OS file lock rejects another IDM API process using the same database.
+- `GET /health` is the only unauthenticated endpoint and returns only `{"status":"ok"}`. Local peer/Host/Origin checks still apply. It indicates process availability, not that analysis or all storage operations are healthy.
+- All other routes require `Authorization: Bearer <key>`. Keys in cookies or query parameters are not accepted. Invalid/missing keys return `401`; insufficient scope returns `403`.
+- The **collector** key can only `POST /collect` and `GET /session`. The **admin** key can use all data and analysis routes. `GET /session` returns `{"role":"admin"}` or `{"role":"collector"}`.
+- Keys are generated from separate 32-byte random values and loaded at process startup. Default credentials live beside the database as `idm.credentials.json`; logs print the path only. Optional environment keys must both be present, distinct, and 43–128 ASCII URL-safe characters. Empty or partial configuration stops startup.
+- Default exact browser origins: `http://127.0.0.1:5173`, `http://localhost:5173`, `http://127.0.0.1:4173`, `http://localhost:4173`. `IDM_FRONTEND_ORIGINS` can replace these with comma-separated exact loopback origins. Chrome extension origins must match `chrome-extension://[a-p]{32}`; knowing an extension ID does not bypass key authentication.
+- CORS permits GET/POST/DELETE and Authorization/Content-Type/X-IDM-Confirm headers. Credential cookies are disabled. Allowed preflight requests do not require a key; subsequent data requests do.
+- Protected responses include `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Online docs and the OpenAPI route are disabled; this file is the maintained contract.
+- Authenticated request bodies are limited to 64 KiB normally, 10 MiB for `/import`, and 20 MiB for `/data/restore`, including bodies without Content-Length. The total read deadline is 10 seconds. At most four authenticated requests enter body processing at once; data operations execute serially, including analysis, backup, deletion and restore.
+- A request that cannot obtain capacity within 0.1 seconds or the data-operation gate within 2 seconds returns `503` with `Retry-After: 5`. Oversize bodies return `413`, malformed Content-Length or duplicate sensitive headers `400`, slow bodies `408`. These are resource bounds, not a completed load/denial-of-service certification. Model execution itself still lacks a hard execution deadline.
+
 ### 3.1 Ingestion
 - `POST /collect`
   - body: single `IngestItem`
@@ -147,6 +159,28 @@ Backend normalization:
 
 - `GET /analyze/result/{job_id}`
   - completed job result payload
+
+### 3.4 Page-record lifecycle (admin only)
+- `GET /data/backup`
+  - downloads UTF-8 JSON named `idm-pages-backup.json`; at most 10,000 records and 20 MiB
+  - envelope: `format: "idm-page-records"`, `version: 1`, `exported_at` (Unix milliseconds), `items`, `sha256`
+  - each item contains only `url,title,text,ts,source,lang,channel,author,tags,meta` under the ingestion contract; internal IDs/hashes/created-at timestamps, credentials, extension queues and derived analysis are excluded
+  - SHA-256 covers the items array encoded with Python `json.dumps(ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))` as UTF-8. It detects accidental damage, not deliberate tampering by someone who can replace the file
+  - records are read in one SQLite snapshot; byte limits are checked during collection and against the final envelope. Oversize data returns `413`; incompatible legacy records return `409` without altering storage
+- `DELETE /items/{item_id}` with `X-IDM-Confirm: delete-record`
+  - deletes the page and its embedding; clears all derived analysis history/jobs/stats in the same transaction
+  - returns `{"deleted":1,"analysis_cleared":true}`, or `404` when absent/outside the positive SQLite integer range
+- `DELETE /data` with `X-IDM-Confirm: delete-all`
+  - deletes all page records, embeddings and derived analysis atomically; returns `{"deleted":n,"analysis_cleared":true}`
+- `POST /data/restore` with `X-IDM-Confirm: replace-records`
+  - body is the complete backup JSON, not multipart upload. The explicit confirmation header is also required for an empty backup
+  - validates format/version/schema/checksum before deleting anything; one transaction then replaces every page record, regenerates embeddings and clears derived analysis
+  - regenerates internal IDs/creation timestamps. The normalized page fields round-trip; this is a logical backup, not a byte-for-byte SQLite restore or migration of all historical database formats
+  - duplicate normalized URLs are an error; any failure rolls back deletion and all partial inserts. Returns `{"restored":n,"analysis_cleared":true}` on commit
+  - bad schema/checksum/duplicates return `422`; storage failures return `500`; missing/wrong confirmation returns `400`
+- Serialization prevents an earlier API analysis from committing a stale snapshot after a successful delete/restore. This does not coordinate other tools writing directly to SQLite.
+- Pause the extension and clear its pending queue before deletion/restoration. Already received requests, later uploads or subsequent browsing can recreate records. Downloaded backups and extension storage are outside these API transactions. No forensic erasure guarantee is made.
+- Client timeouts/disconnects do not certify rollback. Read current data before retrying a destructive action.
 
 ## 4. Important Clarification
 - The dashboard reads live saved-record counts from `GET /items`, independently of analysis.

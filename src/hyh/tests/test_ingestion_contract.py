@@ -13,7 +13,8 @@ from src.hyh.models import IngestItem, MAX_INGEST_TS, MAX_META_BYTES
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "ingestion.sqlite3")
-    with TestClient(api.app, raise_server_exceptions=False) as client:
+    with TestClient(api.app, raise_server_exceptions=False, base_url="http://127.0.0.1", client=("127.0.0.1", 50000),
+                    headers={"Authorization": "Bearer " + "a" * 43}) as client:
         yield client
 
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Information Diet Manager - 本地页面采集",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minimum_chrome_version": "120",
   "incognito": "not_allowed",
   "description": "经用户开启后，将页面标题和正文摘要保存到本机服务",

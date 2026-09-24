@@ -1,6 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const reasons = {
+  invalid_token: '密钥格式不正确，请复制完整的采集密钥', not_paired: '请先保存本机采集密钥，现有队列仍保留',
+  http_401: '采集密钥无效，请重新配置；记录仍保留', http_403: '权限或来源被拒绝，请检查采集密钥和本地服务配置',
   disabled: '采集与同步已暂停', filtered: '页面被排除', queue_full: '队列已满，新增记录被拒收',
   invalid_record: '记录格式不合格', invalid_url: '页面地址不合格', invalid_ack: '服务响应不符合入库确认契约，记录仍保留',
   invalid_settings: '配置不合格，请检查数值和域名', invalid_endpoint: '仅允许本机 HTTP/HTTPS 地址，路径须为 /collect',
@@ -39,6 +41,7 @@ async function refresh() {
   $('lastSuccessAt').textContent = formatTime(status.stats.lastSuccessAt);
   $('lastError').textContent = status.stats.lastError ? '最近问题：' + explain(status.stats.lastError) : '';
   $('queueState').textContent = !enabled ? '已暂停；现有队列保留。'
+    : !status.paired ? '尚未填写采集密钥，现有队列仅保存在扩展中。'
     : status.syncing ? '正在等待服务确认…'
     : status.queueSize === 0 ? '没有待确认记录。'
     : status.blockedCount === status.queueSize ? '记录需要检查服务或配置后手动重试。'
@@ -46,7 +49,7 @@ async function refresh() {
     : '等待下次同步，可点击立即同步。';
 }
 function populate(settings) {
-  for (const key of ['endpoint', 'flushIntervalMinutes', 'minTextLength']) $(key).value = settings[key];
+  for (const key of ['endpoint', 'apiToken', 'flushIntervalMinutes', 'minTextLength']) $(key).value = settings[key];
   $('blockedDomains').value = settings.blockedDomains.join('\n');
 }
 async function action(task, group = 'settings') {
@@ -71,6 +74,7 @@ $('toggleBtn').addEventListener('click', () => action(async () => {
 $('saveBtn').addEventListener('click', () => action(async () => {
   populate(await update({
     endpoint: $('endpoint').value.trim(),
+    apiToken: $('apiToken').value.trim(),
     flushIntervalMinutes: Number($('flushIntervalMinutes').value),
     minTextLength: Number($('minTextLength').value),
     blockedDomains: $('blockedDomains').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean),

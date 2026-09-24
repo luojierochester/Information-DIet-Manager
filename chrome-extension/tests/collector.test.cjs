@@ -21,7 +21,7 @@ function fixture(options = {}) {
     clock: () => now, random: () => 0, version: 'test', ...options });
   return { collector, storage, advance: ms => { now += ms; } };
 }
-async function active(options) { const f = fixture(options); await f.collector.initialize(); await f.collector.updateSettings({ enabled: true }); return f; }
+async function active(options) { const f = fixture(options); await f.collector.initialize(); await f.collector.updateSettings({ enabled: true, apiToken: 'c'.repeat(43) }); return f; }
 function gate() { let resolve; return { promise: new Promise(r => { resolve = r; }), resolve: value => resolve(value) }; }
 async function until(check) { for (let i = 0; i < 200; i++) { if (check()) return; await new Promise(setImmediate); } throw new Error('condition not reached'); }
 
@@ -186,4 +186,25 @@ test('disabled and short-content collection do not enqueue; empty status has no 
   await f.collector.updateSettings({ enabled: true });
   assert.equal((await f.collector.enqueue({ ...record(), text: 'short' })).reason, 'filtered');
   assert.equal((await f.collector.status()).nextRetryAt, null);
+});
+test('unpaired queue is retained without sending a request', async () => {
+  let calls = 0;
+  const f = await active({ fetchImpl: async () => { calls++; return response(); } });
+  await f.collector.updateSettings({ apiToken: '' }); await f.collector.enqueue(record());
+  const result = await f.collector.flush();
+  assert.equal(result.reason, 'not_paired'); assert.equal(calls, 0); assert.equal(result.queueSize, 1);
+});
+test('collector sends scoped key in header, hides it from status and recovers after rejected key replacement', async () => {
+  let sentKey;
+  const f = await active({ fetchImpl: async (_url, options) => {
+    sentKey = options.headers.Authorization;
+    assert.equal(options.body.includes('c'.repeat(43)), false);
+    return sentKey === 'Bearer ' + 'd'.repeat(43) ? response() : response({}, 401);
+  } });
+  await f.collector.enqueue(record()); assert.equal((await f.collector.flush()).blocked, 1);
+  assert.equal(JSON.stringify(await f.collector.status()).includes('c'.repeat(43)), false);
+  await f.collector.updateSettings({ apiToken: 'd'.repeat(43) });
+  assert.equal((await f.collector.flush()).queueSize, 0);
+  assert.equal(sentKey, 'Bearer ' + 'd'.repeat(43));
+  await assert.rejects(f.collector.updateSettings({ apiToken: 'short' }), /invalid_token/);
 });

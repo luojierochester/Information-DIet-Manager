@@ -80,3 +80,7 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: npm run build
+
+      - name: Verify authenticated UI and data recovery
+        working-directory: frontend
+        run: npm run test:e2e

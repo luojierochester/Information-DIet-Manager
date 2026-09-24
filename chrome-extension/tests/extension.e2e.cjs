@@ -7,6 +7,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const { randomBytes } = require('node:crypto');
 const { chromium } = require('playwright');
 
 const extension = path.resolve(__dirname, '..');
@@ -16,6 +17,8 @@ const profile = path.join(temp, 'profile');
 const artifacts = path.join(root, 'output', 'playwright', 'round2');
 fs.mkdirSync(artifacts, { recursive: true });
 const checks = [];
+const adminKey = randomBytes(32).toString('base64url'), collectorKey = randomBytes(32).toString('base64url');
+const authHeaders = { Authorization: 'Bearer ' + adminKey };
 const pass = name => { checks.push(name); console.log('PASS ' + name); };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check, label, timeout = 15000) {
@@ -44,12 +47,13 @@ async function run() {
   const portProbe = http.createServer(); const apiPort = await listen(portProbe); await close(portProbe);
   const api = `http://127.0.0.1:${apiPort}`;
   backend = spawn(process.env.IDM_TEST_PYTHON || 'python', ['-m', 'uvicorn', 'src.backend_api.app:app', '--host', '127.0.0.1', '--port', String(apiPort)], {
-    cwd: root, windowsHide: true, env: { ...process.env, IDM_DB_PATH: path.join(temp, 'synthetic.sqlite3'), HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', PYTHONUTF8: '1' },
+    cwd: root, windowsHide: true, env: { ...process.env, IDM_DB_PATH: path.join(temp, 'synthetic.sqlite3'), IDM_ADMIN_TOKEN: adminKey, IDM_COLLECTOR_TOKEN: collectorKey, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', PYTHONUTF8: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   backend.stdout.on('data', data => { backendLog += data; }); backend.stderr.on('data', data => { backendLog += data; });
   backend.on('error', error => { backendLog += error.message; });
-  await until(async () => { try { return (await fetch(api + '/items')).ok; } catch { return false; } }, 'API ready');
+  await until(async () => { try { return (await fetch(api + '/health')).ok; } catch { return false; } }, 'API ready');
+  assert.equal((await fetch(api + '/items')).status, 401);
   const options = { channel: 'chromium', headless: true, args: [
     `--disable-extensions-except=${extension}`, `--load-extension=${extension}`,
     '--host-resolver-rules=MAP fixture.test 127.0.0.1', '--no-proxy-server',
@@ -65,6 +69,7 @@ async function run() {
   const status = () => message('GET_STATUS');
   async function settings(endpoint, blocked = '') {
     await popup.bringToFront(); await popup.locator('#endpoint').fill(endpoint);
+    await popup.locator('#apiToken').fill(collectorKey);
     await popup.locator('#blockedDomains').fill(blocked); await popup.locator('#saveBtn').click();
     await popup.waitForFunction(() => document.querySelector('#result').textContent === '配置已保存。' && !document.querySelector('#saveBtn').disabled);
   }
@@ -81,7 +86,7 @@ async function run() {
   await until(async () => (await status()).queueSize === 1, 'initial page collection');
   pass('explicit enable collects an already loaded static page');
   await flush(); assert.equal((await status()).queueSize, 0);
-  let rows = await (await fetch(api + '/items')).json(); assert.equal(rows.total, 1);
+  let rows = await (await fetch(api + '/items', { headers: authHeaders })).json(); assert.equal(rows.total, 1);
   const saved = rows.items[0];
   assert.equal(saved.url.includes('SECRET_QUERY'), false); assert.equal(saved.url.includes('topic=tests'), true);
   assert.equal(saved.text.includes('PRIVATE_'), false); assert.deepEqual(Object.keys(saved.meta), ['pluginVersion']);
@@ -89,7 +94,7 @@ async function run() {
   await page.bringToFront();
   await page.evaluate(() => { history.pushState({}, '', '/spa'); document.title = 'Synthetic SPA route'; });
   await until(async () => (await status()).queueSize === 1, 'SPA route collection');
-  await flush(); rows = await (await fetch(api + '/items')).json(); assert.equal(rows.total, 2);
+  await flush(); rows = await (await fetch(api + '/items', { headers: authHeaders })).json(); assert.equal(rows.total, 2);
   pass('page-world SPA navigation is collected without reloading');
   await settings(api + '/collect', 'fixture.test'); await page.bringToFront(); await page.goto(`http://fixture.test:${pagePort}/blocked`);
   await delay(1800); assert.equal((await status()).queueSize, 0);
@@ -109,7 +114,7 @@ async function run() {
   popup = await context.newPage(); await popup.goto(popupUrl);
   assert.equal((await status()).queueSize, 1); assert.equal((await status()).enabled, true);
   await settings(api + '/collect'); await flush();
-  assert.equal((await status()).queueSize, 0); rows = await (await fetch(api + '/items')).json(); assert.equal(rows.total, 3);
+  assert.equal((await status()).queueSize, 0); rows = await (await fetch(api + '/items', { headers: authHeaders })).json(); assert.equal(rows.total, 3);
   pass('offline data and opt-in survive browser/worker restart, then reach real API');
 
   await settings(`http://127.0.0.1:${stubPort}/collect`);
