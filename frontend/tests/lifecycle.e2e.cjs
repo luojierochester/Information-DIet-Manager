@@ -62,6 +62,7 @@ async function run() {
   const context = await browser.newContext({ acceptDownloads: true, viewport: { width: 1280, height: 1000 } });
   const page = await context.newPage(); page.on('pageerror', error => errors.push(error.message));
   await page.goto(uiOrigin); await page.locator('.tech-header h1').waitFor();
+  await page.evaluate(() => document.fonts.ready);
   const settingsPanel = page.locator('.settings-panel');
   const savedTotal = page.getByTestId('saved-total');
   const showSettings = async () => {
@@ -85,12 +86,20 @@ async function run() {
   await page.screenshot({ path: path.join(artifacts, 'disconnected.png'), fullPage: true });
   pass('production page renders disconnected; no private records are loaded');
 
-  const gridBeforeSettings = await page.locator('.dashboard-grid').boundingBox();
+  // Focus/hover auto-scrolling can change viewport coordinates without a
+  // layout change (including the dashboard's overflow container on Windows).
+  // Compare all three siblings in their shared layout coordinate system;
+  // actual repositioning or resizing still fails these exact assertions.
+  const homeLayout = () => page.locator('.tech-header, .summary-card, .dashboard-grid').evaluateAll(elements => elements.map(element => ({
+    x: element.offsetLeft, y: element.offsetTop, width: element.offsetWidth, height: element.offsetHeight,
+  })));
+  const gridBeforeSettings = await homeLayout();
   await showSettings();
   assert.equal(await settingsPanel.getByTestId('admin-key').count(), 1);
+  assert.deepEqual(await homeLayout(), gridBeforeSettings, 'Opening settings must not reposition or resize the home layout');
   await hideSettings();
   assert.equal(await page.getByTestId('admin-key').isVisible(), false);
-  const gridAfterSettings = await page.locator('.dashboard-grid').boundingBox();
+  const gridAfterSettings = await homeLayout();
   assert.deepEqual(gridAfterSettings, gridBeforeSettings);
   pass('original four-chart cyber dashboard remains in place; settings toggle does not relayout the home page');
 
