@@ -1,6 +1,7 @@
 # Project workflow
 
 - Target: an open-source app that each user runs locally; prioritize Windows + Chrome and trustworthy statistics. Mark unvalidated analysis as experimental.
+- Preserve the owner's frontend design from `4d0bcd9aae47ae2b51eb7277f3639d0d97875e14`: cyber palette, glass cards, animations, four-chart layout, original theme controls, and right-side sliding drawer. Do not redesign the frontend during backend or quality work. Only interface/data wiring may change without a new explicit design request. The owner approved putting authentication, backup, restore and deletion inside the original gear settings panel; do not add management cards to the homepage or deletion buttons to the drawer. Preserve truthful experimental labels and missing-data semantics.
 - After completing a coherent round of changes, run the relevant checks, inspect the staged diff, commit the intended changes, and push to this repository's `origin`. This is the owner's standing workflow request; follow any later instruction to defer a commit or push.
 - Fetch before integrating or publishing. Preserve remote work and resolve overlapping changes deliberately; do not force-push shared history.
 - Keep commits focused and describe the resulting behavior. Report the commit link, verification results, and material remaining limitations.
