@@ -43,17 +43,20 @@ docs/                         审查记录与分轮改进说明
 
 ## 本地开发启动（PowerShell）
 
-下面先启动记录存储与界面，不要求下载机器学习模型。本轮验证环境为 Python 3.12、Node.js 24、Windows 和 Chrome；尚未建立完整版本兼容矩阵。
+下面先启动记录存储与界面，不要求下载机器学习模型。本轮锁定和验证环境为 Windows AMD64、CPython 3.12、Node.js 24 和 Chrome；尚未建立其他平台兼容矩阵。
 
 从项目根目录执行：
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-runtime.txt
+.\.venv\Scripts\python.exe -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/installer.txt
+.\.venv\Scripts\python.exe -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/runtime-windows-py312.txt
 
 # 默认使用当前 Windows 用户的 LocalAppData 数据目录
 .\.venv\Scripts\python.exe scripts/run_backend.py
 ```
+
+根 `requirements-runtime.txt` / `requirements-test.txt` 是维护者的直接依赖输入；常规安装使用上述完整哈希锁。锁定范围、更新流程及安装与审计集合校验见 [Python 依赖锁说明](docs/python-locks-2026-10-03.md)。已有环境若混入模型或其他工具，请另建干净环境执行验收，不要据此卸载自己的工具。
 
 另开终端启动前端：
 
@@ -124,8 +127,8 @@ npm run dev -- --host 127.0.0.1 --strictPort
 # 项目根目录：HTTP 契约与现有静态契约测试，无模型下载
 python scripts/check_repository_hygiene.py
 python -m unittest discover -s scripts/tests -p test_repository_hygiene.py -v
-.\.venv\Scripts\python.exe -m pip install -r requirements-test.txt
-.\.venv\Scripts\python.exe -m pytest src/hyh/tests src/lsj/tests -q
+.\.venv\Scripts\python.exe -m pip --isolated install --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/test-windows-py312.txt
+.\.venv\Scripts\python.exe -m pytest src/hyh/tests src/lsj/tests scripts/tests -q
 
 # 扩展状态机、消息边界和内容脚本回归，无浏览器依赖
 node --test chrome-extension/tests/*.test.cjs
@@ -151,7 +154,7 @@ Windows CI 会执行上述 Python、扩展与前端单元/浏览器测试及构�
 
 ## 当前发布边界
 
-当前是本地开发预览，尚未达到严格企业级发布标准。已建立基础采集可靠性、API 访问保护、页面记录删除与事务恢复及自动验收。逐站权限、保留周期、重复访问模型、真实算法验收、完整依赖锁定、仓库/许可证和发布治理仍未完成。现有安全机制不防御同一用户权限的恶意进程、已被控制的浏览器或操作系统。`/analyze/run` 和 `/dashboard/summary` 统一统计所有已保存页面；`/analyze/run_full` 只保存自身分析窗口，不能覆盖全局数量。前端仍不依赖这三个旧接口，见 [旧统计接口修复](docs/legacy-statistics-2026-10-03.md)。
+当前是本地开发预览，尚未达到严格企业级发布标准。已建立基础采集可靠性、API 访问保护、页面记录删除与事务恢复及自动验收。逐站权限、保留周期、重复访问模型、真实算法验收、模型与审计工具依赖锁定、许可证和发布治理仍未完成。现有安全机制不防御同一用户权限的恶意进程、已被控制的浏览器或操作系统。`/analyze/run` 和 `/dashboard/summary` 统一统计所有已保存页面；`/analyze/run_full` 只保存自身分析窗口，不能覆盖全局数量。前端仍不依赖这三个旧接口，见 [旧统计接口修复](docs/legacy-statistics-2026-10-03.md)。
 
 仪表盘分析在计算期间不持有数据操作总锁或 SQLite 写锁，采集和删除可继续；删除/恢复导致版本变化时丢弃旧结果并返回 409。真实模型入口共享单任务锁，容量超限仍会返回可重试的 503。旧 `run_full` 仍需要完整样本：缺失比较等验证失败返回 422 和失败任务，不再伪装成功或因该输入条件返回 500；其旧综合评分尚未验收。
 

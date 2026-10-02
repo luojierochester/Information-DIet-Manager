@@ -33,8 +33,7 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: |
-            requirements-runtime.txt
-            requirements-test.txt
+            requirements/locks/*.txt
 
       - name: Reject tracked runtime data and local dependencies
         run: python scripts/check_repository_hygiene.py
@@ -51,8 +50,19 @@ jobs:
             frontend/package-lock.json
             chrome-extension/package-lock.json
 
-      - name: Install minimal Python test dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements-test.txt
+      - name: Install hashed Python dependencies in a clean environment
+        shell: pwsh
+        run: |
+          $pythonTestEnv = Join-Path $env:RUNNER_TEMP 'idm-python-test'
+          python -m venv $pythonTestEnv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pythonTest = Join-Path $pythonTestEnv 'Scripts/python.exe'
+          & $pythonTest -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/installer.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonTest -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/test-windows-py312.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Join-Path $pythonTestEnv 'Scripts') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "IDM_TEST_PYTHON=$pythonTest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Check Python dependency compatibility
         run: python -m pip check
@@ -63,18 +73,27 @@ jobs:
           $pythonAuditEnv = Join-Path $env:RUNNER_TEMP 'idm-python-audit'
           python -m venv $pythonAuditEnv
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & (Join-Path $pythonAuditEnv 'Scripts/python.exe') -m pip install --disable-pip-version-check --index-url https://pypi.org/simple pip-audit==2.10.1
+          $pythonAudit = Join-Path $pythonAuditEnv 'Scripts/python.exe'
+          & $pythonAudit -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/installer.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonAudit -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: pip-audit==2.10.1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Audit the complete minimal Python dependency tree
+      - name: Audit every locked Python package and installer
         shell: pwsh
         run: |
           $pythonAudit = Join-Path $env:RUNNER_TEMP 'idm-python-audit/Scripts/python.exe'
-          & $pythonAudit -m pip_audit --strict -r requirements-test.txt --index-url https://pypi.org/simple --vulnerability-service pypi --progress-spinner off --format json
+          $applicationAudit = Join-Path $env:RUNNER_TEMP 'idm-application-audit.json'
+          $installerAudit = Join-Path $env:RUNNER_TEMP 'idm-installer-audit.json'
+          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/test-windows-py312.txt --vulnerability-service pypi --progress-spinner off --format json --output $applicationAudit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/installer.txt --vulnerability-service pypi --progress-spinner off --format json --output $installerAudit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_python_dependencies.py --lock requirements/locks/test-windows-py312.txt --installer-lock requirements/locks/installer.txt --runtime-lock requirements/locks/runtime-windows-py312.txt --input requirements-test.txt --audit $applicationAudit --installer-audit $installerAudit
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run API and algorithm contract tests
-        run: python -m pytest src/hyh/tests src/lsj/tests -q
+        run: python -m pytest src/hyh/tests src/lsj/tests scripts/tests -q
 
       - name: Run extension tests
         run: node --test chrome-extension/tests/*.test.cjs
