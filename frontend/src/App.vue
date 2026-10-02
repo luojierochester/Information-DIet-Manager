@@ -211,6 +211,7 @@ const recordsDialog = ref(null), recordsButton = ref(null), settingsButton = ref
 const deleteRecordId = ref('')
 const pieRef = ref(null), graphRef = ref(null), repeatRef = ref(null), sentimentRef = ref(null)
 let recordController, analysisController, timer, charts
+let recordBackground = false
 let disposed = false
 const analysisMessage = computed(() => {
   const state = analysis.value
@@ -228,6 +229,7 @@ const formatUtc = value => typeof value === 'number' && Number.isFinite(new Date
 
 function resetData() {
   dataGeneration++; recordController?.abort(); analysisController?.abort()
+  recordController = undefined; recordBackground = false
   Object.assign(records, emptyRecords())
   recordsLoading.value = false; recordsError.value = false; recordsUpdatedAt.value = null; recordsRefreshed.value = false
   analysis.value = emptyAnalysis(); category.value = 'global'; deleteRecordId.value = ''
@@ -284,18 +286,25 @@ async function deleteRecord(id) {
 }
 
 async function fetchRecords(append = false, background = false) {
-  if (!connected.value || maintenance.value || recordsLoading.value || (append && !records.hasMore)) return
-  recordsLoading.value = true
+  if (disposed || !connected.value || maintenance.value || (append && !records.hasMore)) return
+  if (recordController) {
+    // Explicit reads take priority over polling. Foreground reads remain
+    // serialized so two page requests cannot append the same cursor.
+    if (background || !recordBackground) return
+    recordController.abort()
+  }
+  recordsLoading.value = !background
   const controller = new AbortController()
   let epoch = dataGeneration
-  recordController = controller
+  recordController = controller; recordBackground = background
+  const current = () => !disposed && epoch === dataGeneration && recordController === controller && !controller.signal.aborted
   try {
     let response, refreshed = false
     try {
       response = await api.get('/items', { params: { pagination: 'cursor', page_size: 50,
         ...(append ? { cursor: records.nextCursor } : {}) }, signal: controller.signal })
     } catch (error) {
-      if (!append || error.code !== 'items_snapshot_expired' || epoch !== dataGeneration) throw error
+      if (!append || error.code !== 'items_snapshot_expired' || !current()) throw error
       // The old set can contain deleted or replaced records. Clear it before
       // the single recovery request; never merge across snapshots or retry in a loop.
       dataGeneration++; epoch = dataGeneration; analysisController?.abort()
@@ -306,7 +315,7 @@ async function fetchRecords(append = false, background = false) {
     }
     // An already-started poll must not replace loaded pages while the user
     // is choosing a record in settings or reading the drawer.
-    if (epoch !== dataGeneration || (background && (showSettings.value || drawerOpen.value))) return
+    if (!current() || (background && (showSettings.value || drawerOpen.value))) return
     const page = recordsPage(response.data)
     if (!append && page.page !== 1) throw new Error('Invalid first records page')
     Object.assign(records, append ? mergeRecordsPage(records, page) : page)
@@ -315,9 +324,13 @@ async function fetchRecords(append = false, background = false) {
     recordsUpdatedAt.value = Date.now()
     recordsError.value = false
   } catch (error) {
-    if (epoch === dataGeneration && error.message === 'HTTP_401') { disconnect(); connectionMessage.value = t.value.keyError }
-    else if (epoch === dataGeneration && error.name !== 'AbortError') recordsError.value = true
-  } finally { if (recordController === controller) recordsLoading.value = false }
+    if (current() && error.message === 'HTTP_401') { disconnect(); connectionMessage.value = t.value.keyError }
+    else if (current() && error.name !== 'AbortError') recordsError.value = true
+  } finally {
+    if (recordController === controller) {
+      recordController = undefined; recordBackground = false; recordsLoading.value = false
+    }
+  }
 }
 async function runAnalysis() {
   if (!connected.value || maintenance.value || analysis.value.status === 'loading') return

@@ -19,9 +19,9 @@ let browser, backend, backendLog = '';
 const checks = [], errors = [];
 const pass = label => { checks.push(label); console.log('PASS ' + label); };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-async function until(check, name) {
+async function until(check, name, timeout = 15000) {
   const started = Date.now();
-  while (Date.now() - started < 15000) { if (await check()) return; await delay(100); }
+  while (Date.now() - started < timeout) { if (await check()) return; await delay(100); }
   throw new Error('Timed out: ' + name);
 }
 async function listen(server) { await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); return server.address().port; }
@@ -261,6 +261,84 @@ async function run() {
   await until(async () => await savedTotal.textContent() === '2', 'restore count');
   pass('valid backup restores the page records through the UI');
 
+  // Hold a real background response, then collect a page that only a later
+  // foreground request can see. Keep the browser's real 30-second interval.
+  const recordsFirstPage = url => url.origin === api && url.pathname === '/items' && !url.searchParams.has('cursor');
+  let releaseBackground, backgroundFinished = false;
+  await until(async () => !(await page.getByTestId('refresh-records').isDisabled()), 'restore refresh finished');
+  await page.route(recordsFirstPage, async route => {
+    const response = await route.fetch();
+    assert.equal((await response.json()).total, 2);
+    await new Promise(resolve => { releaseBackground = resolve; });
+    await route.fulfill({ response }).catch(() => {});
+    backgroundFinished = true;
+  }, { times: 1 });
+  await hideSettings();
+  await until(() => Boolean(releaseBackground), 'real background poll in flight', 35000);
+  const duringPollUrl = 'https://example.invalid/arrived-during-background-poll';
+  const duringPollCollection = await fetch(api + '/collect', { method: 'POST', headers: { Authorization: 'Bearer ' + collector, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: duringPollUrl, title: 'Page collected after background snapshot', text: 'Synthetic polling race', ts: Date.now(), source: 'plugin' }) });
+  assert.equal(duringPollCollection.status, 200);
+  assert.equal((await duringPollCollection.json()).inserted, 1);
+  try {
+    await page.getByTestId('records-toggle').click();
+    await until(async () => await savedTotal.textContent() === '3' && await page.getByTestId('record-row').count() === 3,
+      'drawer opening supersedes pending background poll', 5000);
+    assert.equal(await page.getByTestId('record-row').locator('a').first().getAttribute('href'), duringPollUrl);
+  } finally { releaseBackground(); }
+  await until(() => backgroundFinished, 'obsolete background response released');
+  assert.equal(await savedTotal.textContent(), '3', 'Late background response cannot overwrite the fresh drawer snapshot');
+  pass('opening the drawer supersedes a pending real background poll and includes pages collected after its snapshot');
+  await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
+  await showSettings();
+  const transientRecord = (await (await fetch(api + '/items', { headers })).json()).items.find(item => item.url === duringPollUrl);
+  assert.equal((await fetch(api + '/items/' + transientRecord.id, { method: 'DELETE', headers: { ...headers, 'X-IDM-Confirm': 'delete-record' } })).status, 200);
+  await page.getByTestId('refresh-records').click();
+  await until(async () => await savedTotal.textContent() === '2', 'polling fixture cleanup');
+
+  // An explicit settings refresh must also supersede polling. Hold both real
+  // responses to ensure the cancelled poll cannot end the new loading state.
+  releaseBackground = undefined; backgroundFinished = false;
+  await until(async () => !(await page.getByTestId('refresh-records').isDisabled()), 'cleanup refresh finished');
+  await page.route(recordsFirstPage, async route => {
+    const response = await route.fetch();
+    assert.equal((await response.json()).total, 2);
+    await new Promise(resolve => { releaseBackground = resolve; });
+    await route.fulfill({ response }).catch(() => {});
+    backgroundFinished = true;
+  }, { times: 1 });
+  await hideSettings();
+  await until(() => Boolean(releaseBackground), 'second real background poll in flight', 35000);
+  assert.equal((await fetch(api + '/collect', { method: 'POST', headers: { Authorization: 'Bearer ' + collector, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: duringPollUrl, title: 'Page collected before manual refresh', text: 'Synthetic polling race', ts: Date.now(), source: 'plugin' }) })).status, 200);
+  let releaseManualRefresh;
+  const holdManualRefresh = async route => {
+    const response = await route.fetch();
+    assert.equal((await response.json()).total, 3);
+    await new Promise(resolve => { releaseManualRefresh = resolve; });
+    await route.fulfill({ response });
+  };
+  // Keep interception registered until both held responses finish. Two
+  // expiring routes let Playwright disable interception when the old handler
+  // ends, which can resume the new request before its test gate is released.
+  await page.route(recordsFirstPage, holdManualRefresh);
+  await showSettings();
+  assert.equal(await page.getByTestId('refresh-records').isDisabled(), false, 'Background polling must not disable explicit refresh');
+  await page.getByTestId('refresh-records').click();
+  await until(() => Boolean(releaseManualRefresh), 'manual refresh supersedes background poll');
+  assert.equal(await page.getByTestId('refresh-records').isDisabled(), true);
+  releaseBackground();
+  await until(() => backgroundFinished, 'second obsolete background response released');
+  assert.equal(await page.getByTestId('refresh-records').isDisabled(), true, 'Old request cleanup must not end the foreground loading state');
+  releaseManualRefresh();
+  await until(async () => await savedTotal.textContent() === '3' && !(await page.getByTestId('refresh-records').isDisabled()), 'manual refresh rendered');
+  await page.unroute(recordsFirstPage, holdManualRefresh);
+  pass('explicit settings refresh supersedes polling and its loading state survives late background completion');
+  const manualTransientRecord = (await (await fetch(api + '/items', { headers })).json()).items.find(item => item.url === duringPollUrl);
+  assert.equal((await fetch(api + '/items/' + manualTransientRecord.id, { method: 'DELETE', headers: { ...headers, 'X-IDM-Confirm': 'delete-record' } })).status, 200);
+  await page.getByTestId('refresh-records').click();
+  await until(async () => await savedTotal.textContent() === '2', 'manual polling fixture cleanup');
+
   // A second page must come from the protected API, not a local UI fixture.
   for (let i = 2; i < 53; i++) {
     const response = await fetch(api + '/collect', { method: 'POST', headers: { Authorization: 'Bearer ' + collector, 'Content-Type': 'application/json' },
@@ -445,6 +523,31 @@ async function run() {
   assert.equal(await savedTotal.textContent(), '—');
   pass('server authentication rejection removes the local management session and visible data');
   await page.screenshot({ path: path.join(artifacts, 'final.png'), fullPage: true });
+
+  // Exercise Vue's actual unmount hook without navigating or closing the tab,
+  // which would cancel fetches independently and hide missing app cleanup.
+  await page.unroute(api + '/items?**');
+  await page.getByTestId('admin-key').fill(admin); await page.getByTestId('connect').click();
+  await until(async () => await savedTotal.textContent() === '0' && !(await page.getByTestId('refresh-records').isDisabled()), 'reconnection before unmount');
+  let releaseUnmountResponse, unmountResponseFinished = false;
+  await page.route(recordsFirstPage, async route => {
+    const response = await route.fetch();
+    await new Promise(resolve => { releaseUnmountResponse = resolve; });
+    await route.fulfill({ response }).catch(() => {});
+    unmountResponseFinished = true;
+  }, { times: 1 });
+  await page.getByTestId('refresh-records').click();
+  await until(() => Boolean(releaseUnmountResponse), 'real records response held before unmount');
+  const unmountedRequest = page.waitForEvent('requestfailed', {
+    predicate: request => request.method() === 'GET' && recordsFirstPage(new URL(request.url())), timeout: 5000,
+  });
+  await page.evaluate(() => document.querySelector('#app').__vue_app__.unmount());
+  assert.match((await unmountedRequest).failure().errorText, /abort/i);
+  releaseUnmountResponse();
+  await until(() => unmountResponseFinished, 'late response released after unmount');
+  assert.equal(await page.locator('#app').textContent(), '');
+  assert.equal(await page.getByTestId('saved-total').count(), 0);
+  pass('actual component unmount aborts a pending real records request and late delivery cannot restore private UI');
   assert.deepEqual(errors, []);
   fs.writeFileSync(path.join(artifacts, 'verification.json'), JSON.stringify({ browser: browser.version(), checks, temporaryData: true }, null, 2));
   console.log(JSON.stringify({ passed: checks.length, artifacts }, null, 2));
