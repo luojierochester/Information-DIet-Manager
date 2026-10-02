@@ -15,7 +15,8 @@ def _resolve_log_path(log_file: str) -> Path:
         return path
     # Existing callers use ../../logs/<name>. Only their filename is relevant:
     # the working directory must never select a location outside the app data.
-    base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share")
+    configured = os.environ.get("LOCALAPPDATA")
+    base = Path(configured) if configured and configured.strip() else Path.home() / ".local" / "share"
     return base.expanduser() / "InformationDietManager" / "logs" / path.name
 
 

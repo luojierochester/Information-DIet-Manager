@@ -79,7 +79,7 @@ def test_absolute_log_path_is_honored(logging_utility, tmp_path):
     assert not root.exists()
 
 
-@pytest.mark.parametrize("value", [None, ""])
+@pytest.mark.parametrize("value", [None, "", " ", "\t\r\n"])
 def test_missing_or_empty_localappdata_uses_current_user_data_directory(logging_utility, monkeypatch, tmp_path, value):
     module, configure, _root = logging_utility
     if value is None:
