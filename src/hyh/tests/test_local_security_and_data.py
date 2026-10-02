@@ -258,11 +258,14 @@ def test_busy_dashboard_analysis_does_not_block_records_and_keeps_protected_erro
         client.portal.call(gate.release)
 
 
-def test_legacy_scoring_releases_model_lock_when_data_gate_times_out(client):
+def test_legacy_scoring_does_not_acquire_or_release_another_data_operation_gate(client):
     gate = api.app.state.operation_lock
     client.portal.call(gate.acquire)
     try:
-        assert client.post("/analyze/run_full", headers=ADMIN).status_code == 503
+        response = client.post("/analyze/run_full", headers=ADMIN)
+        assert response.status_code == 200
+        assert response.json()["result"]["analysis_status"] == "empty"
+        assert gate.locked()
         assert not api.app.state.analysis_lock.locked()
     finally:
         client.portal.call(gate.release)

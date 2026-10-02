@@ -4,14 +4,16 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from io import BytesIO
 from typing import Literal
 
 from fastapi import HTTPException, Request
-from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from . import export_io
 from .db import get_conn
 from .models import IngestItem
+from .owned_work import run_owned_sync
 
 MAX_BACKUP_RECORDS = 10000
 MAX_BACKUP_BYTES = 20 * 1024 * 1024
@@ -47,33 +49,46 @@ def require_confirmation(request: Request, value: str):
         raise HTTPException(400, "Explicit operation confirmation required")
 
 
+def _prepare_backup_response():
+    items = []
+    try:
+        with get_conn() as conn:
+            conn.execute("BEGIN")
+            if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > MAX_BACKUP_RECORDS:
+                raise HTTPException(413, "Backup supports at most 10000 page records")
+            size = 2  # JSON array brackets; enforce the byte budget while reading rows.
+            for row in conn.execute("SELECT * FROM items ORDER BY id"):
+                record = {key: row[key] for key in FIELDS}
+                for key in ("tags", "meta"):
+                    record[key] = json.loads(record[key]) if record[key] is not None else None
+                record = IngestItem.model_validate(record).model_dump(mode="json")
+                size += len(canonical_items(record)) + int(bool(items))
+                if size > MAX_BACKUP_BYTES:
+                    raise HTTPException(413, "Backup exceeds 20 MiB")
+                items.append(record)
+        digest = hashlib.sha256(canonical_items(items)).hexdigest()
+        payload = {"format": "idm-page-records", "version": 1, "exported_at": int(time.time() * 1000), "items": items, "sha256": digest}
+        body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    except (ValueError, TypeError, ValidationError, RecursionError):
+        raise HTTPException(409, "Stored legacy records do not satisfy the current backup contract") from None
+    if len(body) > MAX_BACKUP_BYTES:
+        raise HTTPException(413, "Backup exceeds 20 MiB")
+    # Preserve the existing bounded backup encoding. Its completed in-memory
+    # artifact uses the same chunking, cancellation and lifetime as file exports.
+    stream = BytesIO(body)
+    try:
+        response = export_io.PreparedExportResponse(stream, len(body), fmt="json", filename="idm-pages-backup")
+        response.headers["Content-Disposition"] = 'attachment; filename="idm-pages-backup.json"'
+        return response
+    except BaseException:
+        stream.close()
+        raise
+
+
 def install_data_routes(app, insert_items):
     @app.get("/data/backup")
-    def backup():
-        items = []
-        try:
-            with get_conn() as conn:
-                conn.execute("BEGIN")
-                if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > MAX_BACKUP_RECORDS:
-                    raise HTTPException(413, "Backup supports at most 10000 page records")
-                size = 2  # JSON array brackets; enforce the byte budget while reading rows.
-                for row in conn.execute("SELECT * FROM items ORDER BY id"):
-                    record = {key: row[key] for key in FIELDS}
-                    for key in ("tags", "meta"):
-                        record[key] = json.loads(record[key]) if record[key] is not None else None
-                    record = IngestItem.model_validate(record).model_dump(mode="json")
-                    size += len(canonical_items(record)) + int(bool(items))
-                    if size > MAX_BACKUP_BYTES:
-                        raise HTTPException(413, "Backup exceeds 20 MiB")
-                    items.append(record)
-            digest = hashlib.sha256(canonical_items(items)).hexdigest()
-            payload = {"format": "idm-page-records", "version": 1, "exported_at": int(time.time() * 1000), "items": items, "sha256": digest}
-            body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-        except (ValueError, TypeError, ValidationError, RecursionError):
-            raise HTTPException(409, "Stored legacy records do not satisfy the current backup contract") from None
-        if len(body) > MAX_BACKUP_BYTES:
-            raise HTTPException(413, "Backup exceeds 20 MiB")
-        return Response(body, media_type="application/json", headers={"Content-Disposition": 'attachment; filename="idm-pages-backup.json"'})
+    async def backup():
+        return await run_owned_sync(_prepare_backup_response, on_cancel=lambda response: response.close())
 
     @app.delete("/items/{item_id}")
     def delete_item(item_id: int, request: Request):

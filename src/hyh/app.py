@@ -28,6 +28,7 @@ from .data_management import install_data_routes
 from .item_pagination import read_cursor_page
 from .visualization_metrics import finite_metric
 from . import export_io
+from .owned_work import run_owned_sync
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -758,6 +759,19 @@ def _load_items_from_jsonl(text: str) -> List[Dict[str, Any]]:
 
 
 # 以下函数用于辅助“后端->逻辑”的接口实现
+def _load_analysis_cache(value: Any) -> Dict[str, Any]:
+    """Reject legacy non-JSON numbers rather than reusing them as missing values."""
+    try:
+        payload = json.loads(value)
+        if not isinstance(payload, dict):
+            return {}
+        # json.loads accepts NaN/Infinity and overflows 1e999 to infinity.
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        return payload
+    except (TypeError, ValueError, RecursionError):
+        return {}
+
+
 def _safe_json_loads(value: Any) -> Any:
     if value is None:
         return None
@@ -1188,12 +1202,30 @@ def analyze_history(limit: int = Query(20, ge=1, le=200)) -> Dict[str, Any]:
 
 
 @app.post("/analyze/run_full")
-def run_full_analysis(
+async def run_full_analysis(
     force: bool = Query(False),
     from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=50000),
 ) -> Dict[str, Any]:
+    return await run_owned_sync(
+        _run_full_analysis_snapshot, force=force, from_ts=from_ts,
+        to_ts=to_ts, limit_rows=limit_rows,
+    )
+
+
+def _failed_full_response(conn, job_id, started_at, input_count, status, message):
+    duration = _now_ms() - started_at
+    _update_analysis_job(
+        conn, job_id, status=JOB_FAILED, error=message,
+        metrics_json={"cache_hit": False, "input_count": input_count, "duration_ms": duration},
+        duration_ms=duration, finished_at=_now_ms(),
+    )
+    # Returning lets the connection commit the failed job.
+    return JSONResponse(status_code=status, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
+
+
+def _run_full_analysis_snapshot(*, force, from_ts, to_ts, limit_rows):
     if from_ts is not None and to_ts is not None and from_ts > to_ts:
         raise HTTPException(
             status_code=400, detail="from_ts cannot be greater than to_ts"
@@ -1202,6 +1234,7 @@ def run_full_analysis(
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         item_state = _item_dataset_state(conn)
+        revision = {key: item_state[key] for key in ("database_id", "revision")}
         max_created_at = int(item_state["max_created_at"])
         rows = _load_items_for_analysis(
             conn, from_ts=from_ts, to_ts=to_ts, limit_rows=limit_rows
@@ -1228,13 +1261,7 @@ def run_full_analysis(
                 """,
                 (input_hash, max_created_at, JOB_COMPLETED),
             ).fetchone()
-            cached_payload: Dict[str, Any] = {}
-            if cached:
-                if cached["result_payload"]:
-                    try:
-                        cached_payload = json.loads(cached["result_payload"])
-                    except (TypeError, json.JSONDecodeError):
-                        cached_payload = {}
+            cached_payload = _load_analysis_cache(cached["result_payload"]) if cached else {}
             if (cached and isinstance(cached_payload, dict)
                     and cached_payload.get("statistics_scope") == "analysis_window"
                     and cached_payload.get("statistics_version") == 2
@@ -1293,46 +1320,62 @@ def run_full_analysis(
             status=JOB_RUNNING,
             started_at=started_at,
         )
+
+    # Inference owns no SQLite connection or data-operation lock. Inserts can
+    # proceed; destructive changes invalidate this snapshot before publication.
+    failure = None
+    try:
+        pipeline = _run_lsj_pipeline(rows)
+        now_ms = _now_ms()
+
+        channel_counts: Dict[str, int] = {}
+        for r in rows:
+            key = _canonicalize_channel_key(r.get("channel"))
+            channel_counts[key] = channel_counts.get(key, 0) + 1
+        channel_counts = _normalize_channel_counts(channel_counts) or {
+            key: 0 for key in CHANNEL_CANONICAL_KEYS
+        }
+
+        # Windowed experimental metrics belong only to their run/job.
+        # stats_daily is reserved for whole-library basic page statistics.
+        payload = {
+            "day": day,
+            "statistics_scope": "analysis_window",
+            "statistics_version": 2,
+            "analysis_status": "ready" if input_count else "empty",
+            "repeat_metric": "legacy_adjacent_text_similarity_threshold_fraction",
+            "window": {"from_ts": from_ts, "to_ts": to_ts, "limit_rows": limit_rows,
+                       "input_count": input_count},
+            "total_count": int(pipeline["input_count"]),
+            "channel_counts": channel_counts,
+            "category_counts": pipeline["category_counts"],
+            "sentiment_counts": pipeline["sentiment_counts"],
+            "comparison_count": pipeline["comparison_count"],
+            "sentiment_count": pipeline["sentiment_count"],
+            "polarity_count": pipeline["polarity_count"],
+            "repeat_ratio": pipeline["repeat_ratio"],
+            "negative_ratio": pipeline["negative_ratio"],
+            "avg_sentiment": pipeline["avg_sentiment"],
+            "quick_evaluation": pipeline["quick_evaluation"],
+            "full_report": pipeline["full_report"],
+            "pipeline_warning": pipeline.get("pipeline_warning"),
+            "generated_at": now_ms,
+            "cached": False,
+        }
+    except AnalysisUnavailableError:
+        failure = (503, "Experimental analysis is unavailable; check the local analysis dependencies and configuration.")
+    except ValueError:
+        failure = (422, "Legacy scoring lacks complete valid measurements; use /dashboard/visualization for partial statistics.")
+    except Exception:
+        failure = (500, "Legacy analysis failed; no valid result was produced.")
+
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_analysis_revision(conn, revision, job_id=job_id)
+        if failure is not None:
+            return _failed_full_response(conn, job_id, started_at, input_count, *failure)
         conn.execute("SAVEPOINT legacy_analysis_result")
-
         try:
-            pipeline = _run_lsj_pipeline(rows)
-            now_ms = _now_ms()
-
-            channel_counts: Dict[str, int] = {}
-            for r in rows:
-                key = _canonicalize_channel_key(r.get("channel"))
-                channel_counts[key] = channel_counts.get(key, 0) + 1
-            channel_counts = _normalize_channel_counts(channel_counts) or {
-                key: 0 for key in CHANNEL_CANONICAL_KEYS
-            }
-
-            # Windowed experimental metrics belong only to their run/job.
-            # stats_daily is reserved for whole-library basic page statistics.
-            payload = {
-                "day": day,
-                "statistics_scope": "analysis_window",
-                "statistics_version": 2,
-                "analysis_status": "ready" if input_count else "empty",
-                "repeat_metric": "legacy_adjacent_text_similarity_threshold_fraction",
-                "window": {"from_ts": from_ts, "to_ts": to_ts, "limit_rows": limit_rows,
-                           "input_count": input_count},
-                "total_count": int(pipeline["input_count"]),
-                "channel_counts": channel_counts,
-                "category_counts": pipeline["category_counts"],
-                "sentiment_counts": pipeline["sentiment_counts"],
-                "comparison_count": pipeline["comparison_count"],
-                "sentiment_count": pipeline["sentiment_count"],
-                "polarity_count": pipeline["polarity_count"],
-                "repeat_ratio": pipeline["repeat_ratio"],
-                "negative_ratio": pipeline["negative_ratio"],
-                "avg_sentiment": pipeline["avg_sentiment"],
-                "quick_evaluation": pipeline["quick_evaluation"],
-                "full_report": pipeline["full_report"],
-                "pipeline_warning": pipeline.get("pipeline_warning"),
-                "generated_at": now_ms,
-                "cached": False,
-            }
             conn.execute(
                 """
                 INSERT INTO analysis_runs (
@@ -1347,7 +1390,9 @@ def run_full_analysis(
                     payload["repeat_ratio"],
                     payload["negative_ratio"],
                     payload["avg_sentiment"],
-                    _as_json(payload),
+                    # Reject non-finite legacy reports inside the savepoint;
+                    # never persist a completed job with invalid JSON numbers.
+                    json.dumps(payload, ensure_ascii=False, allow_nan=False),
                     0,
                     max_created_at,
                     now_ms,
@@ -1374,47 +1419,13 @@ def run_full_analysis(
                 "cached": False,
                 "result": payload,
             }
-        except AnalysisUnavailableError:
-            conn.execute("ROLLBACK TO legacy_analysis_result")
-            conn.execute("RELEASE legacy_analysis_result")
-            message = "Experimental analysis is unavailable; check the local analysis dependencies and configuration."
-            _update_analysis_job(
-                conn, job_id, status=JOB_FAILED, error=message,
-                duration_ms=_now_ms() - started_at, finished_at=_now_ms(),
-            )
-            # Returning commits the failed job. Raising here would roll it back.
-            return JSONResponse(status_code=503, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
-        except ValueError:
-            conn.execute("ROLLBACK TO legacy_analysis_result")
-            conn.execute("RELEASE legacy_analysis_result")
-            # Legacy scoring still requires complete rows. Missing measurements
-            # (including the first row's predecessor) are not synthetic zeroes.
-            # Persist an explicit rejected job rather than turning this expected
-            # validation outcome into HTTP 500 or a fabricated successful score.
-            message = "Legacy scoring lacks complete valid measurements; use /dashboard/visualization for partial statistics."
-            _update_analysis_job(
-                conn, job_id, status=JOB_FAILED, error=message,
-                duration_ms=_now_ms() - started_at, finished_at=_now_ms(),
-            )
-            return JSONResponse(status_code=422, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
         except Exception:
             conn.execute("ROLLBACK TO legacy_analysis_result")
             conn.execute("RELEASE legacy_analysis_result")
-            message = "Legacy analysis failed; no valid result was produced."
-            _update_analysis_job(
-                conn,
-                job_id,
-                status=JOB_FAILED,
-                error=message,
-                metrics_json={
-                    "cache_hit": False,
-                    "input_count": input_count,
-                    "duration_ms": _now_ms() - started_at,
-                },
-                duration_ms=_now_ms() - started_at,
-                finished_at=_now_ms(),
+            return _failed_full_response(
+                conn, job_id, started_at, input_count, 500,
+                "Legacy analysis failed; no valid result was produced.",
             )
-            return JSONResponse(status_code=500, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
 
 
 @app.get("/analyze/jobs/{job_id}")
@@ -1453,7 +1464,9 @@ def dashboard_summary() -> Dict[str, Any]:
 # 以下路由用于“后端->逻辑”的接口
 def _require_analysis_revision(conn: Any, expected: Dict[str, Any], *, job_id: Optional[int] = None) -> None:
     actual = dict(conn.execute("SELECT database_id, revision FROM items_revision WHERE singleton = 1").fetchone())
-    if actual != expected:
+    job = None if job_id is None else conn.execute("SELECT status FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+    job_inactive = job_id is not None and (job is None or job["status"] != JOB_RUNNING)
+    if actual != expected or job_inactive:
         if job_id is not None:
             # A delete/restore may already have removed this job: UPDATE never
             # recreates it. Direct external updates can leave it present; finish
@@ -1468,13 +1481,20 @@ def _require_analysis_revision(conn: Any, expected: Dict[str, Any], *, job_id: O
 
 
 @app.get("/dashboard/visualization")
-def dashboard_visualization(
+async def dashboard_visualization(
     days: int = Query(DEFAULT_VIS_DAYS, ge=1, le=90),
     from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=50000),
     force: bool = Query(False),
 ) -> Dict[str, Any]:
+    return await run_owned_sync(
+        _dashboard_visualization_snapshot, days=days, from_ts=from_ts,
+        to_ts=to_ts, limit_rows=limit_rows, force=force,
+    )
+
+
+def _dashboard_visualization_snapshot(*, days, from_ts, to_ts, limit_rows, force):
     if from_ts is not None and to_ts is not None and from_ts > to_ts:
         raise HTTPException(
             status_code=400, detail="from_ts cannot be greater than to_ts"
@@ -1537,12 +1557,7 @@ def dashboard_visualization(
                 (input_hash, max_created_at, JOB_COMPLETED),
             ).fetchone()
             if cached:
-                cached_payload: Dict[str, Any] = {}
-                if cached["result_payload"]:
-                    try:
-                        cached_payload = json.loads(cached["result_payload"])
-                    except json.JSONDecodeError:
-                        cached_payload = {}
+                cached_payload = _load_analysis_cache(cached["result_payload"])
                 if (
                     isinstance(cached_payload, dict)
                     and cached_payload.get("analysis_status") == "ready"

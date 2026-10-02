@@ -22,7 +22,7 @@ TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 EXTENSION_ORIGIN = r"chrome-extension://[a-p]{32}"
 DEFAULT_ORIGINS = "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173,http://localhost:4173"
 BODY_LIMITS = {"/collect": 64 * 1024, "/import": 10 * 1024 * 1024, "/data/restore": 20 * 1024 * 1024}
-EXPORT_PATHS = frozenset({"/export/lsj", "/export/lsj/training"})
+EXPORT_PATHS = frozenset({"/export/lsj", "/export/lsj/training", "/data/backup"})
 
 
 @contextmanager
@@ -250,18 +250,13 @@ class LocalAccessMiddleware:
                     return {"type": "http.request", "body": bytes(body), "more_body": False}
                 return await receive()
 
-            # Dashboard analysis has transactional version checks before and
-            # after inference. Keep it single-flight without blocking collection
+            # Both analysis routes check transactional versions before and
+            # after inference. Keep them single-flight without blocking collection
             # and recovery for the duration of optional model loading/inference.
             # Other data operations retain their shared ordering boundary.
             state = scope["app"].state
-            if scope["path"] == "/dashboard/visualization":
+            if scope["path"] in {"/dashboard/visualization", "/analyze/run_full"}:
                 gates = [state.analysis_lock]
-            elif scope["path"] == "/analyze/run_full":
-                # The legacy scorer still needs the data-operation lock. Take
-                # the shared model lock first so competing model requests do
-                # not load a second model or hold the data lock while waiting.
-                gates = [state.analysis_lock, state.operation_lock]
             else:
                 gates = [state.operation_lock]
             acquired = []

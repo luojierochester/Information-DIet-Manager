@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 
 from .db import get_conn
+from .owned_work import run_owned_sync
 from .security import protect_credential_file
 
 MAX_EXPORT_BYTES = 64 * 1024 * 1024
@@ -226,25 +227,4 @@ def prepare_export(*, transform, from_ts, to_ts, limit_rows, fmt, columns, metad
 
 
 async def prepare_export_response(**kwargs):
-    # A cancelled caller must not orphan a still-running preparation thread or
-    # release capacity while it owns private temporary data. Do not cancel the
-    # worker: it must either return its artifact or finish its own cleanup.
-    worker = asyncio.create_task(asyncio.to_thread(prepare_export, **kwargs))
-    try:
-        return await asyncio.shield(worker)
-    except asyncio.CancelledError:
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                break
-        if not worker.cancelled():
-            try:
-                response = worker.result()
-            except Exception:
-                pass  # Preparation already closed its file on failure.
-            else:
-                response.close()
-        raise
+    return await run_owned_sync(prepare_export, on_cancel=lambda response: response.close(), **kwargs)
