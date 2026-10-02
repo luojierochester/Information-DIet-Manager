@@ -28,12 +28,12 @@ def init_db(schema_path: Path) -> None:
 
 
 @contextmanager
-def get_conn() -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA secure_delete = ON")
+def get_conn(*, timeout: float = 5.0) -> Generator[sqlite3.Connection, None, None]:
+    conn = sqlite3.connect(DB_PATH, timeout=timeout)
     try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA secure_delete = ON")
         yield conn
         conn.commit()
     except BaseException:

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import time
+from contextlib import closing
 from io import BytesIO
 from typing import Literal
 
@@ -17,6 +19,9 @@ from .owned_work import run_owned_sync
 
 MAX_BACKUP_RECORDS = 10000
 MAX_BACKUP_BYTES = 20 * 1024 * 1024
+MAX_BACKUP_ROW_BYTES = 128 * 1024
+BACKUP_PREPARE_SECONDS = 15
+_clock = time.monotonic
 FIELDS = ("url", "title", "text", "ts", "source", "lang", "channel", "author", "tags", "meta")
 
 
@@ -49,27 +54,100 @@ def require_confirmation(request: Request, value: str):
         raise HTTPException(400, "Explicit operation confirmation required")
 
 
+class _BackupPreparationBudget:
+    def __init__(self):
+        self.deadline = _clock() + BACKUP_PREPARE_SECONDS
+
+    def remaining(self):
+        remaining = self.deadline - _clock()
+        if remaining <= 0:
+            raise HTTPException(503, "Backup preparation timed out; retry later",
+                                headers={"Retry-After": "5"})
+        return remaining
+
+    def check_time(self):
+        self.remaining()
+
+    def set_busy_timeout(self, conn):
+        # sqlite3's busy handler does not invoke the SQL progress callback.
+        # Refresh the wait allowance before each query/row, never exceeding
+        # the connection's usual five-second maximum or the remaining budget.
+        milliseconds = min(5000, int(self.remaining() * 1000))
+        conn.execute(f"PRAGMA busy_timeout = {milliseconds}").close()
+
+    def execute(self, conn, sql, parameters=()):
+        self.set_busy_timeout(conn)
+        cursor = conn.execute(sql, parameters)
+        try:
+            self.check_time()
+            return cursor
+        except BaseException:
+            cursor.close()
+            raise
+
+
+def _read_backup_items(conn, budget):
+    with closing(budget.execute(conn, "SELECT COUNT(*) FROM items")) as cursor:
+        count = cursor.fetchone()[0]
+    budget.check_time()
+    if count > MAX_BACKUP_RECORDS:
+        raise HTTPException(413, "Backup supports at most 10000 page records")
+    # SQLite computes UTF-8 byte sizes before Python receives legacy values.
+    # Only the backup's fields count; unexported hashes are never loaded.
+    size_sql = " + ".join(f"COALESCE(length(CAST({field} AS BLOB)), 0)" for field in FIELDS)
+    with closing(budget.execute(conn, f"SELECT id, ({size_sql}) AS byte_size FROM items ORDER BY id")) as cursor:
+        items, size = [], 2
+        while True:
+            budget.set_busy_timeout(conn)
+            sized = cursor.fetchone()
+            budget.check_time()
+            if sized is None:
+                break
+            item_id, byte_size = sized
+            if byte_size > MAX_BACKUP_ROW_BYTES:
+                raise HTTPException(413, "Stored record exceeds backup row budget")
+            with closing(budget.execute(conn, f"SELECT {', '.join(FIELDS)} FROM items WHERE id = ?", (item_id,))) as values:
+                row = values.fetchone()
+            budget.check_time()
+            record = {key: row[key] for key in FIELDS}
+            for key in ("tags", "meta"):
+                budget.check_time()
+                record[key] = json.loads(record[key]) if record[key] is not None else None
+                budget.check_time()
+            record = IngestItem.model_validate(record).model_dump(mode="json")
+            budget.check_time()
+            size += len(canonical_items(record)) + int(bool(items))
+            budget.check_time()
+            if size > MAX_BACKUP_BYTES:
+                raise HTTPException(413, "Backup exceeds 20 MiB")
+            items.append(record)
+    return items
+
+
 def _prepare_backup_response():
-    items = []
+    budget = _BackupPreparationBudget()
+    budget.check_time()
     try:
-        with get_conn() as conn:
-            conn.execute("BEGIN")
-            if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > MAX_BACKUP_RECORDS:
-                raise HTTPException(413, "Backup supports at most 10000 page records")
-            size = 2  # JSON array brackets; enforce the byte budget while reading rows.
-            for row in conn.execute("SELECT * FROM items ORDER BY id"):
-                record = {key: row[key] for key in FIELDS}
-                for key in ("tags", "meta"):
-                    record[key] = json.loads(record[key]) if record[key] is not None else None
-                record = IngestItem.model_validate(record).model_dump(mode="json")
-                size += len(canonical_items(record)) + int(bool(items))
-                if size > MAX_BACKUP_BYTES:
-                    raise HTTPException(413, "Backup exceeds 20 MiB")
-                items.append(record)
+        with get_conn(timeout=min(5.0, budget.remaining())) as conn:
+            conn.set_progress_handler(lambda: int(_clock() >= budget.deadline), 1000)
+            try:
+                with closing(budget.execute(conn, "BEGIN")):
+                    pass
+                items = _read_backup_items(conn, budget)
+            finally:
+                conn.set_progress_handler(None, 0)
+        budget.check_time()
         digest = hashlib.sha256(canonical_items(items)).hexdigest()
+        budget.check_time()
         payload = {"format": "idm-page-records", "version": 1, "exported_at": int(time.time() * 1000), "items": items, "sha256": digest}
         body = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        budget.check_time()
+    except sqlite3.OperationalError:
+        budget.check_time()
+        raise HTTPException(503, "Backup database unavailable; retry later",
+                            headers={"Retry-After": "5"}) from None
     except (ValueError, TypeError, ValidationError, RecursionError):
+        budget.check_time()
         raise HTTPException(409, "Stored legacy records do not satisfy the current backup contract") from None
     if len(body) > MAX_BACKUP_BYTES:
         raise HTTPException(413, "Backup exceeds 20 MiB")
@@ -77,6 +155,7 @@ def _prepare_backup_response():
     # artifact uses the same chunking, cancellation and lifetime as file exports.
     stream = BytesIO(body)
     try:
+        budget.check_time()
         response = export_io.PreparedExportResponse(stream, len(body), fmt="json", filename="idm-pages-backup")
         response.headers["Content-Disposition"] = 'attachment; filename="idm-pages-backup.json"'
         return response
