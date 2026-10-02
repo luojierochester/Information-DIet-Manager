@@ -11,9 +11,6 @@ from __future__ import annotations  # 让 Python 3.8/3.9 支持 | 类型注解
     - 自定义模型适合在特定业务标注数据上提升一致性；
     - 两者可以组合使用，以在可解释性与泛化能力之间取得平衡。
 """
-# ======== 环境变量设置 ========
-import os  # 系统环境变量
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'  # 为 HuggingFace 下载配置国内镜像
 # ======== 标准库导入 ========
 import pickle  # 模型持久化
 import math

@@ -9,13 +9,20 @@
     便于在训练前尽早发现标注、分布和样本质量问题。
 """
 import json
-import os
 import random
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from utils.hf_cache import resolve_hub_cache
+
+# Read configuration before model dependencies import their own HF settings.
+HF_HUB_CACHE_DIR = resolve_hub_cache()
+HF_PERSISTENT_MODELS_DIR = HF_HUB_CACHE_DIR / "persistent_models"
 
 import numpy as np
 import torch
@@ -30,31 +37,15 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-sys.path.insert(0, str(Path(__file__).parent))
-
 from classifier import ContentClassifier
 from utils.logger import setup_logger
 
-# Windows 固定 Hugging Face 缓存目录，确保后续训练优先复用本地缓存。
-HF_HUB_CACHE_DIR = Path(r"C:\Users\Administrator\.cache\huggingface\hub")
-HF_HOME_DIR = HF_HUB_CACHE_DIR.parent
-HF_PERSISTENT_MODELS_DIR = HF_HUB_CACHE_DIR / "persistent_models"
-
 
 def configure_huggingface_cache() -> Path:
-    """统一指定 Hugging Face 默认缓存目录，避免落到临时目录。"""
-    HF_HOME_DIR.mkdir(parents=True, exist_ok=True)
-    HF_HUB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    """仅在明确准备模型时创建缓存目录，不改写用户环境配置。"""
     HF_PERSISTENT_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-    os.environ["HF_HOME"] = str(HF_HOME_DIR)
-    os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_HUB_CACHE_DIR)
-    os.environ["TRANSFORMERS_CACHE"] = str(HF_HUB_CACHE_DIR)
-    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
     return HF_HUB_CACHE_DIR
 
-
-configure_huggingface_cache()
 
 try:
     from huggingface_hub import snapshot_download
@@ -72,7 +63,7 @@ def _sanitize_model_cache_name(model_name: str) -> str:
 
 def ensure_model_cached(model_name_or_path: str) -> str:
     """
-    首次运行自动下载模型到固定缓存目录；后续运行优先从本地持久化缓存加载。
+    首次运行自动下载模型到用户配置的缓存目录；后续优先从本地持久化缓存加载。
     保存内容包括模型权重、配置文件、tokenizer 文件以及 Hugging Face 所需依赖文件。
     """
     input_path = Path(model_name_or_path)
