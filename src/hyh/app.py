@@ -4,6 +4,7 @@ import csv
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import re
@@ -843,11 +844,18 @@ def _to_jsonl(items: List[Dict[str, Any]]) -> str:
     return "\n".join(json.dumps(x, ensure_ascii=False) for x in items)
 
 
-def _to_csv(items: List[Dict[str, Any]]) -> str:
-    if not items:
-        return ""
+EXPORT_CSV_COLUMNS = {
+    "analysis": ("id", "title", "url", "analysis_text", "text", "channel", "ts",
+                 "source", "lang", "author", "tags", "meta"),
+    "raw": ("id", "url", "title", "text", "ts", "source", "lang", "channel",
+            "author", "tags", "meta", "created_at"),
+}
+TRAINING_CSV_COLUMNS = ("input", "label", "ts", "url", "title", "source")
+
+
+def _to_csv(items: List[Dict[str, Any]], fieldnames: Iterable[str]) -> str:
+    # The schema belongs to the export contract, including a zero-row result.
     buf = io.StringIO()
-    fieldnames = list(items[0].keys())
     writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
     for row in items:
@@ -862,25 +870,23 @@ def _to_csv(items: List[Dict[str, Any]]) -> str:
 
 
 def _host_is_private(host: str) -> bool:
-    h = (host or "").lower().strip()
+    h = (host or "").strip().lower().rstrip(".")
     if not h:
         return False
-    if h in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+    if h == "localhost" or h.endswith((".localhost", ".local")):
         return True
-    if h.endswith(".local"):
-        return True
-    if h.startswith("10."):
-        return True
-    if h.startswith("192.168."):
-        return True
-    if h.startswith("172."):
-        # 172.16.0.0 - 172.31.255.255
-        parts = h.split(".")
-        if len(parts) >= 2 and parts[1].isdigit():
-            sec = int(parts[1])
-            if 16 <= sec <= 31:
-                return True
-    return False
+    try:
+        address = ipaddress.ip_address(h)
+    except ValueError:
+        # Inspect the URL only: resolving a DNS name leaks browsing hosts and
+        # cannot guarantee the address to which it will resolve in the future.
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    # Global/private flags alone miss some reserved, multicast and site-local IPs.
+    return (not address.is_global or address.is_multicast or address.is_loopback
+            or address.is_link_local or address.is_unspecified or address.is_reserved
+            or (isinstance(address, ipaddress.IPv6Address) and address.is_site_local))
 
 
 def _is_internal_url(url: str) -> bool:
@@ -1719,7 +1725,7 @@ def export_lsj(
         )
 
     # csv
-    content = _to_csv(items)
+    content = _to_csv(items, EXPORT_CSV_COLUMNS[view])
     return StreamingResponse(
         io.StringIO(content),
         media_type="text/csv; charset=utf-8",
@@ -1739,7 +1745,7 @@ def export_lsj_training(
     # 新增参数
     bare: bool = Query(True, description="json格式时仅返回数组，适配 data_cleaning.py"),
     exclude_internal: bool = Query(
-        True, description="过滤 localhost/127.0.0.1/内网地址"
+        True, description="过滤本地域名与非公网、组播 IP 字面量；不解析 DNS"
     ),
     exclude_auth_pages: bool = Query(True, description="过滤登录/oauth/授权回调等页面"),
     exclude_search_pages: bool = Query(False, description="过滤搜索结果页"),
@@ -1791,7 +1797,7 @@ def export_lsj_training(
             },
         )
 
-    content = _to_csv(items)
+    content = _to_csv(items, TRAINING_CSV_COLUMNS)
     return StreamingResponse(
         io.StringIO(content),
         media_type="text/csv; charset=utf-8",

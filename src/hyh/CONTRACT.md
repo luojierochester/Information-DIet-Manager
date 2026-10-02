@@ -201,6 +201,14 @@ Backend normalization:
 - Pause the extension and clear its pending queue before deletion/restoration. Already received requests, later uploads or subsequent browsing can recreate records. Downloaded backups and extension storage are outside these API transactions. No forensic erasure guarantee is made.
 - Client timeouts/disconnects do not certify rollback. Read current data before retrying a destructive action.
 
+### 3.5 Programmatic data export (admin only)
+- `GET /export/lsj?view=analysis|raw&fmt=json|jsonl|csv` exports the selected saved-page fields without the training privacy filter.
+- `GET /export/lsj/training?fmt=json|jsonl|csv` returns training rows with `input,label,ts,url,title,source`; existing whitespace normalization, maximum input length and deduplication remain in effect.
+- Training defaults to `exclude_internal=true`: local domain names and non-public, multicast, reserved or site-local IP literals are excluded. IPv4-mapped IPv6 addresses use the embedded IPv4 classification; trailing domain dots are normalized. Disabling the option preserves those records.
+- This filter performs no DNS lookup or network request. It is not anonymization and does not detect private content in a public URL's path, query or text.
+- CSV column order is fixed for each view; zero-row results include the same header as nonempty results. CSV escaping preserves original values, including text beginning with formula characters; these exports target programmatic readers, not execution as spreadsheet formulas.
+- Export still loads and encodes the selected dataset in memory, with a maximum requested row count of 200,000. The `StreamingResponse` wrapper does not establish a bounded-memory implementation; a byte budget and large-export acceptance remain outstanding.
+
 ## 4. Important Clarification
 - The dashboard reads timestamped saved-record snapshots from `GET /items`, independently of analysis; pagination stays in one snapshot until refresh.
 - Saved items are deduplicated pages, not visit events or measured reading duration.
