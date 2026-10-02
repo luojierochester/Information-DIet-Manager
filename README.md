@@ -9,11 +9,11 @@
 ## 当前界面与数据口径
 
 - **保留原外观**：恢复 `4d0bcd9` 的科技风首页、动效、四图布局与右侧抽屉。中英文、主题、高亮色、字体继续位于右上角齿轮；密钥连接、备份、恢复、删除也收进此设置面板，见 [本轮恢复说明](docs/ui-restoration-2026-09-26.md)。
-- **已保存记录**：实时读取 `/items`，每页 50 条，可加载更多。记录按页面去重，不等于访问次数、精确阅读时长或完整浏览历史。
+- **已保存记录**：从 `/items` 读取带时间的记录快照，每页 50 条，可加载更多。新记录在刷新或重开抽屉后加入。记录按页面去重，不等于访问次数、精确阅读时长或完整浏览历史。
 - **近 7 天实验分析**：只有点击按钮才请求 `/dashboard/visualization?days=7&force=true`，重新计算而不是复用旧缓存。分析范围是最近 7×24 小时，日趋势按 UTC；时间窗口可能跨 8 个日历日期。
 - **明确状态**：没有数据、样本不足、分析不可用、分析失败分别显示。缺失指标不补零，不生成固定评分、处方或虚构逐条情感标签。
 - **快照与覆盖范围**：图表来自同一次分析；新记录不会自动加入。超过分析行数上限时提示只读取最早的一部分。
-- **最低样本量**：目前为 5 条，这是与默认评估器一致的运行门槛，不代表统计充分性或模型准确性保证。
+- **最低样本量**：实验界面目前为 5 条，这是运行门槛，不代表统计充分性或模型准确性保证；各指标的有效数量另行披露。
 
 ## 项目结构
 
@@ -36,6 +36,10 @@ src/lsj/                      数据获取、分类、情感、相似度和评�
   requirements.txt            实验分析依赖清单（尚未完整锁定或验证）
 docs/                         审查记录与分轮改进说明
 ```
+
+当前源码树不再分发根目录 `node_modules`、废弃根 npm 清单或旧 `src/hyh/data/idm.sqlite3`。现有本机文件仅取消 Git 跟踪，未删除或改写；历史提交仍可能包含它们。安装依赖请使用 `frontend/` 和 `chrome-extension/` 的锁文件，勿打包整个工作目录。路径门禁和发布边界见 [仓库卫生记录](docs/repository-hygiene-2026-10-03.md)。
+
+**旧克隆升级前先备份自有旧库**：上面的保留保证只适用于本次执行清理的工作区。其他旧克隆拉取删除提交时，Git 可能移除未修改的旧跟踪文件；若仍使用 `src/hyh/data/idm.sqlite3`，请先将需要的数据备份到仓库外，再更新并通过 `IDM_DB_PATH` 指向自己的数据库。默认的每用户数据库不在仓库中，不受此 Git 变更影响。
 
 ## 本地开发启动（PowerShell）
 
@@ -118,6 +122,8 @@ npm run dev -- --host 127.0.0.1 --strictPort
 
 ```powershell
 # 项目根目录：HTTP 契约与现有静态契约测试，无模型下载
+python scripts/check_repository_hygiene.py
+python -m unittest discover -s scripts/tests -p test_repository_hygiene.py -v
 .\.venv\Scripts\python.exe -m pip install -r requirements-test.txt
 .\.venv\Scripts\python.exe -m pytest src/hyh/tests src/lsj/tests -q
 

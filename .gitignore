@@ -2,6 +2,13 @@
 # Python
 # =========================
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.cache/
 *.py[cod]
 *$py.class
 *.so
@@ -50,9 +57,9 @@ venv.bak/
 # =========================
 # Environment variables
 # =========================
-.env
-.env.local
-.env.*.local
+*.env
+*.env.*
+!.env.example
 
 # =========================
 # OS files
@@ -73,6 +80,20 @@ logs/
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.db.lock
+*.sqlite.lock
+*.sqlite3.lock
+credentials.json
+credentials.json.new
 *.credentials.json
 *.credentials.json.new
 src/hyh/data/*.lock
@@ -100,6 +121,16 @@ src/hyh/data/*.lock
 *.model
 *.pkl
 *.pickle
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.h5
+*.hdf5
+pytorch_model.bin
+/models/
+checkpoints/
 src/lsj/src/algorithms/models/
 
 # =========================
@@ -119,6 +150,11 @@ src/lsj/src/training_data/
 # Frontend / extensions
 # =========================
 node_modules/
+# Obsolete root npm entry points stay local; maintain the two supported packages.
+# Use frontend/ and chrome-extension/ for dependency installation and auditing.
+/package.json
+/package-lock.json
+/npm-shrinkwrap.json
 #frontend/
 #chrome-extension/
 #src/chrome-extension/
@@ -128,5 +164,12 @@ node_modules/
 # =========================
 #src/hyh/
 
-# Local browser verification artifacts
-output/playwright/
+# Local verification and generated artifacts
+output/
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+playwright-report/
+test-results/
+dist-ssr/
