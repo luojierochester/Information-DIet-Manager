@@ -10,7 +10,6 @@ import re
 import struct
 import sys
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -26,6 +25,7 @@ from . import db
 from .security import LocalAccessMiddleware, LocalSecurity, process_ownership
 from .data_management import install_data_routes
 from .item_pagination import read_cursor_page
+from .visualization_metrics import finite_metric
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -267,22 +267,16 @@ def _backfill_missing_embeddings(conn: Any, limit: int = 2000) -> int:
     return count
 
 
-def _payload_from_stats_row(row: Any) -> Dict[str, Any]:
-    channel_counts = None
-    if row["channel_counts"]:
-        try:
-            channel_counts = _normalize_channel_counts(json.loads(row["channel_counts"]))
-        except json.JSONDecodeError:
-            channel_counts = None
-    return {
-        "day": row["day"],
-        "total_count": row["total_count"],
-        "channel_counts": channel_counts,
-        "repeat_ratio": row["repeat_ratio"],
-        "negative_ratio": row["negative_ratio"],
-        "avg_sentiment": row["avg_sentiment"],
-        "generated_at": row["updated_at"],
-    }
+def _item_dataset_state(conn: Any) -> Dict[str, Any]:
+    """Read inside the caller's transaction; timestamps alone miss same-ms inserts."""
+    state = dict(conn.execute(
+        "SELECT COUNT(*) AS total_count, COALESCE(MAX(id), 0) AS max_id, "
+        "COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
+    ).fetchone())
+    state.update(dict(conn.execute(
+        "SELECT database_id, revision FROM items_revision WHERE singleton = 1"
+    ).fetchone()))
+    return state
 
 
 def _stable_hash_payload(data: Dict[str, Any]) -> str:
@@ -421,23 +415,13 @@ def _execute_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "evaluator": evaluator,
             "df3": df3,
         }
-    except Exception as exc:
-        normalized = [
-            normalize_text(
-                str(r.get("title") or ""), str(r.get("text") or r.get("title") or "")
-            )
-            for r in rows
-        ]
-        total = len(normalized)
-        distinct = len(set(normalized))
-        repeat_ratio = float(
-            0.0 if total == 0 else max(0.0, min(1.0, 1 - (distinct / total)))
-        )
+    except Exception:
+        # Model exceptions can contain source text or private filesystem paths.
+        # Do not expose/persist them or replace failed inference with hash scores.
         return {
             "ok": False,
-            "input_count": total,
-            "repeat_ratio": repeat_ratio,
-            "warning": f"lsj pipeline unavailable: {exc}",
+            "input_count": len(rows),
+            "warning": "Experimental analysis is unavailable; check the local analysis dependencies and configuration.",
         }
 
 
@@ -599,63 +583,72 @@ def _update_analysis_job(
     )
 
 
+class AnalysisUnavailableError(RuntimeError):
+    """Expected optional-inference failure; never carries raw model exceptions."""
+
+
 def _run_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not rows:
         return {
             "input_count": 0,
             "category_counts": {},
             "sentiment_counts": {},
-            "negative_ratio": 0.0,
-            "avg_sentiment": 0.0,
-            "repeat_ratio": 0.0,
+            "comparison_count": 0,
+            "sentiment_count": 0,
+            "polarity_count": 0,
+            "negative_ratio": None,
+            "avg_sentiment": None,
+            "repeat_ratio": None,
             "quick_evaluation": None,
             "full_report": None,
         }
 
     execution = _execute_lsj_pipeline(rows)
     if not execution.get("ok"):
-        total = int(execution.get("input_count") or 0)
-        return {
-            "input_count": total,
-            "category_counts": {"unknown": total},
-            "sentiment_counts": {"Neutral": total},
-            "negative_ratio": 0.0,
-            "avg_sentiment": 0.0,
-            "repeat_ratio": float(execution.get("repeat_ratio") or 0.0),
-            "quick_evaluation": None,
-            "full_report": None,
-            "pipeline_warning": execution.get("warning"),
-        }
-
-    import pandas as pd  # type: ignore
+        raise AnalysisUnavailableError("Experimental analysis is unavailable.")
 
     evaluator = execution["evaluator"]
     df3 = execution["df3"]
     quick = evaluator.quick_evaluate(df3)
     report = evaluator.evaluate(df3, detailed=False).to_dict()
 
-    sentiment_norm = df3["sentiment"].fillna("").astype(str).str.lower()
     category_norm = df3["category"].fillna("other").astype(str)
-    polarity_num = pd.to_numeric(df3["polarity"], errors="coerce").fillna(0.0)
-    similarity_num = (
-        pd.to_numeric(df3["similarity"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
-    )
-
-    negative_ratio = float((sentiment_norm == "negative").mean())
-    avg_sentiment = float(polarity_num.mean())
-    repeat_ratio = float((similarity_num >= DEFAULT_REPEAT_THRESHOLD).mean())
+    similarities: List[float] = []
+    polarities: List[float] = []
+    sentiment_counts: Dict[str, int] = {}
+    for index, row in enumerate(df3.to_dict("records")):
+        similarity = finite_metric(row.get("similarity"), 0, 1)
+        if (index > 0 and similarity is not None
+                and ("similarity_valid" not in row or row["similarity_valid"] is True)):
+            similarities.append(similarity)
+        sentiment = row.get("sentiment")
+        label = sentiment.strip().lower() if isinstance(sentiment, str) else None
+        if (label not in {"positive", "neutral", "negative"}
+                or ("sentiment_valid" in row and row["sentiment_valid"] is not True)):
+            continue
+        # Only the metric with missing measurements loses observations; category
+        # counts above retain the complete input, including the first record.
+        key = label.title()
+        sentiment_counts[key] = sentiment_counts.get(key, 0) + 1
+        polarity = finite_metric(row.get("polarity"), -1, 1)
+        if polarity is not None:
+            polarities.append(polarity)
+    sentiment_count = sum(sentiment_counts.values())
+    negative_ratio = sentiment_counts.get("Negative", 0) / sentiment_count if sentiment_count else None
+    avg_sentiment = math.fsum(polarities) / len(polarities) if polarities else None
+    repeat_ratio = (sum(value >= DEFAULT_REPEAT_THRESHOLD for value in similarities) / len(similarities)
+                    if similarities else None)
 
     category_counts = {
         str(k): int(v) for k, v in category_norm.value_counts().to_dict().items()
     }
-    sentiment_counts = {
-        str(k): int(v) for k, v in df3["sentiment"].value_counts().to_dict().items()
-    }
-
     return {
         "input_count": int(execution["input_count"]),
         "category_counts": category_counts,
         "sentiment_counts": sentiment_counts,
+        "comparison_count": len(similarities),
+        "sentiment_count": sentiment_count,
+        "polarity_count": len(polarities),
         "negative_ratio": negative_ratio,
         "avg_sentiment": avg_sentiment,
         "repeat_ratio": repeat_ratio,
@@ -1107,69 +1100,68 @@ def list_items(
     return {**metadata, "items": items}
 
 
-@app.post("/analyze/run")
-def run_analysis(
-    force: bool = Query(False),
-    backfill_limit: int = Query(2000, ge=0, le=20000),
-) -> Dict[str, Any]:
+def _global_statistics(*, force: bool, backfill_limit: int, record_run: bool) -> Dict[str, Any]:
+    """Whole-library page counts, never windowed model scores.
+
+    stats_daily is a compatibility projection only: old releases wrote arbitrary
+    analysis windows there. Only explicitly versioned global run payloads can
+    be reused, and all state/count/cache reads share a short write transaction.
+    """
     day = datetime.now(timezone.utc).date().isoformat()
     with get_conn() as conn:
-        item_state = conn.execute(
-            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
-        ).fetchone()
-        max_created_at = int(item_state["max_created_at"] or 0)
+        conn.execute("BEGIN IMMEDIATE")
+        item_state = _item_dataset_state(conn)
+        max_created_at = int(item_state["max_created_at"])
+        data_version = _stable_hash_payload(item_state)
         existing = conn.execute(
-            "SELECT * FROM stats_daily WHERE day = ? LIMIT 1",
+            "SELECT payload FROM analysis_runs WHERE day = ? ORDER BY id DESC LIMIT 1",
             (day,),
         ).fetchone()
-        if (
-            not force
-            and existing is not None
-            and int(existing["updated_at"] or 0) >= max_created_at
-        ):
-            cached_payload = _payload_from_stats_row(existing)
-            cached_payload["cached"] = True
-            cached_payload["embeddings_backfilled"] = 0
-            conn.execute(
-                """
-                INSERT INTO analysis_runs (
-                    day, total_count, channel_counts, repeat_ratio, negative_ratio, avg_sentiment,
-                    payload, cached, item_max_created_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    day,
-                    cached_payload["total_count"],
-                    _as_json(cached_payload.get("channel_counts")),
-                    cached_payload.get("repeat_ratio"),
-                    cached_payload.get("negative_ratio"),
-                    cached_payload.get("avg_sentiment"),
-                    _as_json(cached_payload),
-                    1,
-                    max_created_at,
-                    _now_ms(),
-                ),
-            )
-            return cached_payload
+        payload = None
+        if not force and existing is not None:
+            try:
+                candidate = json.loads(existing["payload"])
+            except (TypeError, json.JSONDecodeError):
+                candidate = None
+            if (isinstance(candidate, dict)
+                    and candidate.get("statistics_scope") == "all_saved_pages"
+                    and candidate.get("statistics_version") == 1
+                    and candidate.get("data_version") == data_version
+                    and candidate.get("total_count") == item_state["total_count"]):
+                payload = {**candidate, "cached": True, "embeddings_backfilled": 0}
 
-        backfilled = 0
-        if backfill_limit > 0:
-            backfilled = _backfill_missing_embeddings(conn, limit=backfill_limit)
+        if payload is None:
+            backfilled = _backfill_missing_embeddings(conn, limit=backfill_limit) if backfill_limit > 0 else 0
+            content = conn.execute(
+                "SELECT COUNT(*) AS measured, COUNT(DISTINCT content_hash) AS distinct_count "
+                "FROM items WHERE content_hash IS NOT NULL AND content_hash != ''"
+            ).fetchone()
+            sample_count = int(content["measured"])
+            repeat_ratio = ((sample_count - int(content["distinct_count"])) / sample_count
+                            if sample_count else None)
+            channel_rows = conn.execute("SELECT channel, COUNT(*) AS cnt FROM items GROUP BY channel").fetchall()
+            channel_counts = {key: 0 for key in CHANNEL_CANONICAL_KEYS}
+            for row in channel_rows:
+                channel_counts[_canonicalize_channel_key(row["channel"])] += int(row["cnt"])
+            payload = {
+                "day": day,
+                "total_count": int(item_state["total_count"]),
+                "channel_counts": channel_counts,
+                "repeat_ratio": repeat_ratio,
+                "repeat_sample_count": sample_count,
+                "repeat_metric": "duplicate_normalized_content_hash_fraction",
+                "negative_ratio": None,
+                "avg_sentiment": None,
+                "generated_at": _now_ms(),
+                "cached": False,
+                "embeddings_backfilled": backfilled,
+                "statistics_scope": "all_saved_pages",
+                "statistics_version": 1,
+                "data_version": data_version,
+            }
 
-        total = conn.execute("SELECT COUNT(*) AS cnt FROM items").fetchone()["cnt"]
-        distinct_content = conn.execute(
-            "SELECT COUNT(DISTINCT content_hash) AS cnt FROM items WHERE content_hash IS NOT NULL"
-        ).fetchone()["cnt"]
-        channel_rows = conn.execute(
-            "SELECT channel, COUNT(*) AS cnt FROM items GROUP BY channel"
-        ).fetchall()
-        repeat_ratio = 0.0
-        if total:
-            repeat_ratio = max(0.0, min(1.0, 1 - (distinct_content / total)))
-        channel_counts = _normalize_channel_counts(
-            {row["channel"] or "unknown": row["cnt"] for row in channel_rows}
-        ) or {key: 0 for key in CHANNEL_CANONICAL_KEYS}
-        now_ms = _now_ms()
+        # Rewrite even a cache hit: this repairs old/mixed daily projections
+        # without ever interpreting them as trustworthy global statistics.
         conn.execute(
             """
             INSERT INTO stats_daily (
@@ -1186,47 +1178,35 @@ def run_analysis(
             """,
             (
                 day,
-                total,
-                _as_json(channel_counts),
-                repeat_ratio,
+                payload["total_count"],
+                _as_json(payload["channel_counts"]),
+                payload["repeat_ratio"],
                 None,
                 None,
-                now_ms,
-                now_ms,
+                payload["generated_at"],
+                payload["generated_at"],
             ),
         )
-        payload = {
-            "day": day,
-            "total_count": total,
-            "channel_counts": channel_counts,
-            "repeat_ratio": repeat_ratio,
-            "negative_ratio": None,
-            "avg_sentiment": None,
-            "generated_at": now_ms,
-            "cached": False,
-            "embeddings_backfilled": backfilled,
-        }
-        conn.execute(
-            """
-            INSERT INTO analysis_runs (
-                day, total_count, channel_counts, repeat_ratio, negative_ratio, avg_sentiment,
-                payload, cached, item_max_created_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                day,
-                total,
-                _as_json(channel_counts),
-                repeat_ratio,
-                None,
-                None,
-                _as_json(payload),
-                0,
-                max_created_at,
-                now_ms,
-            ),
-        )
+        if record_run or not payload["cached"]:
+            conn.execute(
+                """
+                INSERT INTO analysis_runs (
+                    day, total_count, channel_counts, repeat_ratio, negative_ratio, avg_sentiment,
+                    payload, cached, item_max_created_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (day, payload["total_count"], _as_json(payload["channel_counts"]), payload["repeat_ratio"],
+                 None, None, _as_json(payload), int(payload["cached"]), max_created_at, _now_ms()),
+            )
         return payload
+
+
+@app.post("/analyze/run")
+def run_analysis(
+    force: bool = Query(False),
+    backfill_limit: int = Query(2000, ge=0, le=20000),
+) -> Dict[str, Any]:
+    return _global_statistics(force=force, backfill_limit=backfill_limit, record_run=True)
 
 
 @app.get("/analyze/history")
@@ -1258,8 +1238,8 @@ def analyze_history(limit: int = Query(20, ge=1, le=200)) -> Dict[str, Any]:
 @app.post("/analyze/run_full")
 def run_full_analysis(
     force: bool = Query(False),
-    from_ts: Optional[int] = Query(None),
-    to_ts: Optional[int] = Query(None),
+    from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
+    to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=50000),
 ) -> Dict[str, Any]:
     if from_ts is not None and to_ts is not None and from_ts > to_ts:
@@ -1268,10 +1248,9 @@ def run_full_analysis(
         )
     day = datetime.now(timezone.utc).date().isoformat()
     with get_conn() as conn:
-        item_state = conn.execute(
-            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
-        ).fetchone()
-        max_created_at = int(item_state["max_created_at"] or 0)
+        conn.execute("BEGIN IMMEDIATE")
+        item_state = _item_dataset_state(conn)
+        max_created_at = int(item_state["max_created_at"])
         rows = _load_items_for_analysis(
             conn, from_ts=from_ts, to_ts=to_ts, limit_rows=limit_rows
         )
@@ -1282,6 +1261,8 @@ def run_full_analysis(
             "to_ts": to_ts,
             "limit_rows": limit_rows,
             "mode": "run_full",
+            "schema_version": 2,
+            "dataset": item_state,
         }
         input_hash = _stable_hash_payload(job_key)
 
@@ -1295,13 +1276,18 @@ def run_full_analysis(
                 """,
                 (input_hash, max_created_at, JOB_COMPLETED),
             ).fetchone()
+            cached_payload: Dict[str, Any] = {}
             if cached:
-                cached_payload: Dict[str, Any] = {}
                 if cached["result_payload"]:
                     try:
                         cached_payload = json.loads(cached["result_payload"])
-                    except json.JSONDecodeError:
+                    except (TypeError, json.JSONDecodeError):
                         cached_payload = {}
+            if (cached and isinstance(cached_payload, dict)
+                    and cached_payload.get("statistics_scope") == "analysis_window"
+                    and cached_payload.get("statistics_version") == 2
+                    and cached_payload.get("analysis_status") in {"ready", "empty"}
+                    and not cached_payload.get("pipeline_warning")):
                 job_id = _insert_analysis_job(
                     conn,
                     status=JOB_COMPLETED,
@@ -1355,6 +1341,7 @@ def run_full_analysis(
             status=JOB_RUNNING,
             started_at=started_at,
         )
+        conn.execute("SAVEPOINT legacy_analysis_result")
 
         try:
             pipeline = _run_lsj_pipeline(rows)
@@ -1368,41 +1355,26 @@ def run_full_analysis(
                 key: 0 for key in CHANNEL_CANONICAL_KEYS
             }
 
-            conn.execute(
-                """
-                INSERT INTO stats_daily (
-                    day, total_count, channel_counts, repeat_ratio, negative_ratio,
-                    avg_sentiment, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(day) DO UPDATE SET
-                    total_count=excluded.total_count,
-                    channel_counts=excluded.channel_counts,
-                    repeat_ratio=excluded.repeat_ratio,
-                    negative_ratio=excluded.negative_ratio,
-                    avg_sentiment=excluded.avg_sentiment,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    day,
-                    int(pipeline["input_count"]),
-                    _as_json(channel_counts),
-                    float(pipeline["repeat_ratio"]),
-                    float(pipeline["negative_ratio"]),
-                    float(pipeline["avg_sentiment"]),
-                    now_ms,
-                    now_ms,
-                ),
-            )
-
+            # Windowed experimental metrics belong only to their run/job.
+            # stats_daily is reserved for whole-library basic page statistics.
             payload = {
                 "day": day,
+                "statistics_scope": "analysis_window",
+                "statistics_version": 2,
+                "analysis_status": "ready" if input_count else "empty",
+                "repeat_metric": "legacy_adjacent_text_similarity_threshold_fraction",
+                "window": {"from_ts": from_ts, "to_ts": to_ts, "limit_rows": limit_rows,
+                           "input_count": input_count},
                 "total_count": int(pipeline["input_count"]),
                 "channel_counts": channel_counts,
                 "category_counts": pipeline["category_counts"],
                 "sentiment_counts": pipeline["sentiment_counts"],
-                "repeat_ratio": float(pipeline["repeat_ratio"]),
-                "negative_ratio": float(pipeline["negative_ratio"]),
-                "avg_sentiment": float(pipeline["avg_sentiment"]),
+                "comparison_count": pipeline["comparison_count"],
+                "sentiment_count": pipeline["sentiment_count"],
+                "polarity_count": pipeline["polarity_count"],
+                "repeat_ratio": pipeline["repeat_ratio"],
+                "negative_ratio": pipeline["negative_ratio"],
+                "avg_sentiment": pipeline["avg_sentiment"],
                 "quick_evaluation": pipeline["quick_evaluation"],
                 "full_report": pipeline["full_report"],
                 "pipeline_warning": pipeline.get("pipeline_warning"),
@@ -1420,9 +1392,9 @@ def run_full_analysis(
                     day,
                     int(pipeline["input_count"]),
                     _as_json(channel_counts),
-                    float(pipeline["repeat_ratio"]),
-                    float(pipeline["negative_ratio"]),
-                    float(pipeline["avg_sentiment"]),
+                    payload["repeat_ratio"],
+                    payload["negative_ratio"],
+                    payload["avg_sentiment"],
                     _as_json(payload),
                     0,
                     max_created_at,
@@ -1443,13 +1415,26 @@ def run_full_analysis(
                 duration_ms=duration_ms,
                 finished_at=_now_ms(),
             )
+            conn.execute("RELEASE legacy_analysis_result")
             return {
                 "job_id": job_id,
                 "status": JOB_COMPLETED,
                 "cached": False,
                 "result": payload,
             }
+        except AnalysisUnavailableError:
+            conn.execute("ROLLBACK TO legacy_analysis_result")
+            conn.execute("RELEASE legacy_analysis_result")
+            message = "Experimental analysis is unavailable; check the local analysis dependencies and configuration."
+            _update_analysis_job(
+                conn, job_id, status=JOB_FAILED, error=message,
+                duration_ms=_now_ms() - started_at, finished_at=_now_ms(),
+            )
+            # Returning commits the failed job. Raising here would roll it back.
+            return JSONResponse(status_code=503, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
         except ValueError:
+            conn.execute("ROLLBACK TO legacy_analysis_result")
+            conn.execute("RELEASE legacy_analysis_result")
             # Legacy scoring still requires complete rows. Missing measurements
             # (including the first row's predecessor) are not synthetic zeroes.
             # Persist an explicit rejected job rather than turning this expected
@@ -1460,26 +1445,24 @@ def run_full_analysis(
                 duration_ms=_now_ms() - started_at, finished_at=_now_ms(),
             )
             return JSONResponse(status_code=422, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
-        except Exception as exc:
-            duration_ms = _now_ms() - started_at
-            err_detail = f"{exc}\n{traceback.format_exc(limit=5)}"
+        except Exception:
+            conn.execute("ROLLBACK TO legacy_analysis_result")
+            conn.execute("RELEASE legacy_analysis_result")
+            message = "Legacy analysis failed; no valid result was produced."
             _update_analysis_job(
                 conn,
                 job_id,
                 status=JOB_FAILED,
-                error=err_detail[:4000],
+                error=message,
                 metrics_json={
                     "cache_hit": False,
                     "input_count": input_count,
-                    "duration_ms": duration_ms,
+                    "duration_ms": _now_ms() - started_at,
                 },
-                duration_ms=duration_ms,
+                duration_ms=_now_ms() - started_at,
                 finished_at=_now_ms(),
             )
-            raise HTTPException(
-                status_code=500,
-                detail=f"run_full failed, job_id={job_id}, error={exc}",
-            ) from exc
+            return JSONResponse(status_code=500, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
 
 
 @app.get("/analyze/jobs/{job_id}")
@@ -1512,17 +1495,7 @@ def get_analyze_result(job_id: int) -> Dict[str, Any]:
 
 @app.get("/dashboard/summary")
 def dashboard_summary() -> Dict[str, Any]:
-    with get_conn() as conn:
-        item_state = conn.execute(
-            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
-        ).fetchone()
-        max_created_at = int(item_state["max_created_at"] or 0)
-        row = conn.execute(
-            "SELECT * FROM stats_daily ORDER BY day DESC LIMIT 1"
-        ).fetchone()
-    if row and int(row["updated_at"] or 0) >= max_created_at:
-        return _payload_from_stats_row(row)
-    return run_analysis(force=False, backfill_limit=2000)
+    return _global_statistics(force=False, backfill_limit=2000, record_run=False)
 
 
 # 以下路由用于“后端->逻辑”的接口
@@ -1702,8 +1675,8 @@ def dashboard_visualization(
 
 @app.get("/export/lsj")
 def export_lsj(
-    from_ts: Optional[int] = Query(None),
-    to_ts: Optional[int] = Query(None),
+    from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
+    to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=200000),
     view: str = Query("analysis", pattern="^(analysis|raw)$"),
     fmt: str = Query("json", pattern="^(json|jsonl|csv)$"),
@@ -1758,8 +1731,8 @@ def export_lsj(
 
 @app.get("/export/lsj/training")
 def export_lsj_training(
-    from_ts: Optional[int] = Query(None),
-    to_ts: Optional[int] = Query(None),
+    from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
+    to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=200000),
     label_field: str = Query("channel", pattern="^(channel|source)$"),
     fmt: str = Query("json", pattern="^(json|jsonl|csv)$"),

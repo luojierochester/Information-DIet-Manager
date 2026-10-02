@@ -32,7 +32,8 @@ Backend normalization:
 - generated on item insert; analysis only backfills missing vectors
 
 ### 2.3 `stats_daily`
-- per-day aggregate snapshot
+- compatibility projection of whole-library page statistics, keyed by generation day; it is not a count of pages visited that day
+- legacy windowed model runs no longer write this table; old rows are not trusted as the global cache
 - fields:
   - `total_count`
   - `channel_counts` (JSON)
@@ -59,7 +60,7 @@ Backend normalization:
 - Default exact browser origins: `http://127.0.0.1:5173`, `http://localhost:5173`, `http://127.0.0.1:4173`, `http://localhost:4173`. `IDM_FRONTEND_ORIGINS` can replace these with comma-separated exact loopback origins. Chrome extension origins must match `chrome-extension://[a-p]{32}`; knowing an extension ID does not bypass key authentication.
 - CORS permits GET/POST/DELETE and Authorization/Content-Type/X-IDM-Confirm headers. Credential cookies are disabled. Allowed preflight requests do not require a key; subsequent data requests do.
 - Protected responses include `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Online docs and the OpenAPI route are disabled; this file is the maintained contract.
-- Authenticated request bodies are limited to 64 KiB normally, 10 MiB for `/import`, and 20 MiB for `/data/restore`, including bodies without Content-Length. The total read deadline is 10 seconds. At most four authenticated requests enter body processing at once; data operations execute serially, including analysis, backup, deletion and restore.
+- Authenticated request bodies are limited to 64 KiB normally, 10 MiB for `/import`, and 20 MiB for `/data/restore`, including bodies without Content-Length. The total read deadline is 10 seconds. At most four authenticated requests enter body processing at once. Data operations share an ordering lock; dashboard model computation instead uses short SQLite transactions and version checks, permitting collection and deletion during inference. Dashboard and legacy full analysis share a single model lock; legacy full analysis still also needs the data-operation lock.
 - A request that cannot obtain capacity within 0.1 seconds or the data-operation gate within 2 seconds returns `503` with `Retry-After: 5`. Oversize bodies return `413`, malformed Content-Length or duplicate sensitive headers `400`, slow bodies `408`. These are resource bounds, not a completed load/denial-of-service certification. Model execution itself still lacks a hard execution deadline.
 
 ### 3.1 Ingestion
@@ -80,30 +81,42 @@ Backend normalization:
   - a storage failure rolls back the entire insert transaction, including earlier valid rows and their embeddings; it does not return a partial-success acknowledgement
 
 - `GET /items?page=1&page_size=20`
-  - list stored raw items
+  - legacy offset pagination; each response is internally consistent, but separate pages can shift under concurrent writes
+- `GET /items?pagination=cursor&page_size=50&cursor=...`
+  - omit `cursor` for the first page; return `page`, `page_size`, `total`, `items`, `pagination: "cursor"`, `snapshot_at`, `has_more` and nullable `next_cursor`
+  - `total` and `snapshot_at` stay fixed for the traversal; later inserts are outside its initial maximum ID and appear after refresh
+  - deletion, update or restore invalidates the cursor with `409 items_snapshot_expired`; rollbacks preserve it
+  - cursors are signed metadata, not credentials; restart invalidates outstanding cursors and access still requires the admin key
+  - keep page size unchanged; do not mix cursor and legacy page/limit parameters
 
 ### 3.2 Stats (lightweight)
 - `POST /analyze/run?force=false&backfill_limit=2000`
   - fast aggregate without full algorithm pipeline
-  - returns cached result when no new items
+  - counts all saved pages with `statistics_scope: "all_saved_pages"`, `statistics_version: 1` and a `data_version`
+  - `repeat_metric: "duplicate_normalized_content_hash_fraction"`; `repeat_ratio` is `(valid hashes - distinct hashes) / valid hashes`, with `repeat_sample_count` disclosed; missing/empty hashes are excluded and no valid hashes means null
+  - `negative_ratio` and `avg_sentiment` are null because this route does not measure sentiment
+  - SQL groups with missing, unknown or aliased channel names are added into their canonical bucket without overwriting one another
+  - reuses only explicitly versioned global payloads matching the database identity/revision, count, maximum ID and creation timestamp; same-millisecond inserts and destructive changes invalidate them
+  - records each explicit request in history, including cache hits
 
 - `GET /dashboard/summary`
-  - latest daily aggregate snapshot
+  - the same whole-library statistics contract as `/analyze/run`; never returns a windowed full-analysis result
+  - a matching cached summary retains its original generation time and does not add a history row on every poll
 
 - `GET /dashboard/visualization?days=7&from_ts=&to_ts=&limit_rows=5000&force=false`
   - on-demand visualization payload for frontend charts
-  - loads raw items in the requested time window, runs `lsj` classify/sentiment/similarity/evaluator pipeline,
-    and returns chart-ready global + category time series
+  - loads raw items ordered by `(ts, id)`, runs `lsj` classify/sentiment/similarity, then independent per-metric aggregation; legacy scoring preprocessing is not used
   - `from_ts` / `to_ts` are optional Unix epoch milliseconds; if omitted, backend uses `days`
   - `force=true` bypasses the cache; the dashboard uses it for every explicit analysis request
-  - cache keys carry visualization schema version 2 so pre-status-contract payloads are not reused; only ready results without warnings are reusable
-  - a cached response retains its original window and generation timestamp; use `force=true` for a fresh rolling window
+  - cache keys carry visualization schema version 3, resolved time boundaries, database identity/revision and maximum ID; only ready results without warnings are reusable
+  - a moving window or changed dataset cannot reuse an old key; a cache hit retains its original generation timestamp
+  - creation and publication check the destructive-data revision inside write transactions; deletion/restore during computation returns `409 analysis_snapshot_expired` without republishing old results
   - response shape:
     - `window`
       - `from_ts`, `to_ts`, `limit_rows`, `input_count`
       - `available_count`: all saved records in the requested window, counted in the same SQLite read snapshot
       - `truncated`: true when the window contains more records than were loaded
-      - `processed_count`: valid rows after preprocessing, present on a ready response
+      - `processed_count`: number of processed records, not the number of valid measurements for every metric
       - selection remains ascending by timestamp; a truncated result is the earliest portion, not a representative sample
     - `analysis_status`: `empty | insufficient_data | unavailable | failed | ready`
       - `empty`: no input records in the requested window
@@ -112,12 +125,14 @@ Backend normalization:
       - `failed`: visualization postprocessing failed
       - `ready`: chart data was produced; this does not certify model accuracy
       - non-ready responses contain empty chart collections, never invented neutral/zero measurements
-    - `minimum_records`: currently 5, an implementation guard matching the default evaluator; not a scientifically validated sample-size requirement
+    - `minimum_records`: currently 5, an implementation guard; not a scientifically validated sample-size requirement
     - `date_timezone`: currently `UTC`; a rolling seven-day window can intersect eight calendar dates
-    - `category_counts`: absolute counts from the same preprocessed sample as the daily series
+    - `category_counts`: absolute counts of valid categories; missing similarity or sentiment does not drop a record's category
       - retains `shopping` and `tools` as separate categories
     - `global`
-      - `time_series`: `[{date, count, avg_polarity, avg_similarity, repeat_ratio, negative_ratio, positive_ratio, neutral_ratio}]`
+      - `time_series`: `[{date, count, comparison_count, sentiment_count, polarity_count, avg_polarity, avg_similarity, repeat_ratio, negative_ratio, positive_ratio, neutral_ratio}]`
+      - similarity/repeat denominators contain only valid original adjacent pairs; the first record has no predecessor; cross-date/category pairs belong to the later record
+      - each sentiment proportion uses valid three-class labels as its own denominator; unavailable measurements are null, never fabricated neutral or zero
       - `category_distribution`, `sentiment_distribution`, `similarity_histogram`, `hourly_distribution`
     - `categories`
       - keyed by normalized category name such as `entertainment`, `learning`, `news`, `social`
@@ -135,6 +150,7 @@ Backend normalization:
     - `pipeline_warning`
       - diagnostic warning for unavailable/failed analysis; clients must not treat it as a successful measurement
     - `generated_at`
+    - `coverage`: `record_count`, `timestamp_count`, `category_count`, `comparison_count`, `sentiment_count`; independent valid quantities, not a model-accuracy claim
 
 - `GET /analyze/history?limit=20`
   - latest run history records
@@ -148,11 +164,14 @@ Backend normalization:
     3. similarity -> `similarity`
     4. evaluator -> report
   - persist:
-    - `stats_daily` (for dashboard)
     - `analysis_runs` (history)
     - `analysis_jobs` (job lifecycle)
-  - if `lsj` runtime dependencies are missing, API still completes with degraded metrics and
-    returns `pipeline_warning` in payload
+  - returns `statistics_scope: "analysis_window"`, `statistics_version: 2`, `analysis_status: "ready" | "empty"` and the requested `window`; it never overwrites whole-library statistics
+  - top-level `comparison_count`, `sentiment_count` and `polarity_count` expose each metric's valid denominator; the first page has no predecessor, invalid/out-of-range measurements and invalid flags are excluded, and empty denominators produce null
+  - top-level `repeat_metric: "legacy_adjacent_text_similarity_threshold_fraction"` uses valid original adjacent comparisons; the embedded quick/full scoring reports remain experimental legacy outputs with their own preprocessing, not independently validated measurements
+  - unavailable dependencies/pipeline return 503, incomplete samples return 422, and unexpected failures return 500; each has a safe fixed message, failed status and `job_id`, without fabricated neutral measurements or raw exception details
+  - a savepoint rolls back partially written successful results while retaining the failed job; a database failure that also prevents saving the job cannot guarantee a durable failure record
+  - empty input does not load optional models; ready means the legacy computation completed, not that its model/scoring accuracy has been accepted
 
 - `GET /analyze/jobs/{job_id}`
   - job status + metadata
@@ -178,23 +197,24 @@ Backend normalization:
   - regenerates internal IDs/creation timestamps. The normalized page fields round-trip; this is a logical backup, not a byte-for-byte SQLite restore or migration of all historical database formats
   - duplicate normalized URLs are an error; any failure rolls back deletion and all partial inserts. Returns `{"restored":n,"analysis_cleared":true}` on commit
   - bad schema/checksum/duplicates return `422`; storage failures return `500`; missing/wrong confirmation returns `400`
-- Serialization prevents an earlier API analysis from committing a stale snapshot after a successful delete/restore. This does not coordinate other tools writing directly to SQLite.
+- Serialized legacy operations and transactional dashboard revision checks prevent earlier analysis from republishing results after successful delete/restore. External updates also invalidate dashboard results through schema triggers; directly removing triggers or replacing live database files is unsupported.
 - Pause the extension and clear its pending queue before deletion/restoration. Already received requests, later uploads or subsequent browsing can recreate records. Downloaded backups and extension storage are outside these API transactions. No forensic erasure guarantee is made.
 - Client timeouts/disconnects do not certify rollback. Read current data before retrying a destructive action.
 
 ## 4. Important Clarification
-- The dashboard reads live saved-record counts from `GET /items`, independently of analysis.
+- The dashboard reads timestamped saved-record snapshots from `GET /items`, independently of analysis; pagination stays in one snapshot until refresh.
 - Saved items are deduplicated pages, not visit events or measured reading duration.
 - The dashboard requests visualization only on explicit user action. It displays the result as an experimental snapshot.
-- Visualization failures/unavailability are recorded as failed jobs, not successful measurements; `/analyze/run_full` retains its separate legacy behavior.
+- Visualization and legacy full-analysis failures/unavailability are recorded as failed jobs, not successful measurements.
 - Missing dates/metrics are unknown values, not zero. Zero proportions are valid observations.
-- Existing `/analyze/run`, `/analyze/run_full` and `/dashboard/summary` retain their older behavior; their degraded metrics are not covered by the visualization status contract above. The current dashboard does not consume them.
+- `/analyze/run` and `/dashboard/summary` measure saved-page statistics; `/analyze/run_full` retains experimental legacy scoring for its explicit window. They are distinct contracts, and the current dashboard does not consume them.
 - Client upload payload does **not** include:
   - `category`, `sentiment`, `polarity`, `similarity`
 - These are derived fields generated inside analysis pipeline before evaluator.
 
 ## 5. Caching and Idempotency
-- same input window + same `item_max_created_at` reuses previous completed result
+- full-analysis cache schema version 2 includes the input window and database identity/revision/count/maximum ID/creation timestamp; only completed, warning-free, explicitly versioned results are reusable
+- dashboard visualization uses its separate schema version 3 and resolved time window; global lightweight statistics use version 1 and the dataset state
 - cache events are recorded in `analysis_jobs` (`cache_hit = 1`)
 
 ## 6. Error Contract
@@ -202,4 +222,5 @@ Backend normalization:
 - job not found -> `404`
 - result requested before completion -> `409`
 - storage failure during ingestion -> `500`, without a successful acknowledgement; only normalized-URL uniqueness conflicts count as duplicates, other database constraint failures do not
-- pipeline/internal failure -> `500` with `job_id` in detail where the analysis job endpoint supplies one
+- legacy full-analysis unavailable/incomplete/unexpected failures -> `503` / `422` / `500` with `job_id`, `status: "failed"` and a safe `detail` string
+- full analysis and both `/export/lsj` routes accept `from_ts` / `to_ts` only from `0` through `253402300799999`; out-of-range parameters return `422` before SQLite access, and reversed valid boundaries return `400`
