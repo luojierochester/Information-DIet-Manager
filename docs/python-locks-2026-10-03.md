@@ -11,6 +11,7 @@
 | `requirements/locks/installer.txt` | 固定 pip 26.2.1 官方 wheel 的 SHA-256，单独审计安装器 |
 | `requirements/locks/runtime-windows-py312.txt` | 14 个运行包的完整版本与允许的 SHA-256 |
 | `requirements/locks/test-windows-py312.txt` | 29 个运行/测试包的完整版本与允许的 SHA-256 |
+| `requirements/locks/toolchain-windows-py312.txt` | 独立审计/锁生成工具及其传递依赖的完整哈希锁；后续治理批次新增 |
 | `scripts/lock_python_dependencies.py` | 先生成运行锁，再用运行锁约束测试锁 |
 | `scripts/verify_python_dependencies.py` | 对比输入、锁、实际安装和审计的包名/版本集合 |
 
@@ -36,7 +37,7 @@ $appPython = '.venv/Scripts/python.exe'
 
 因此，门禁对完整哈希锁使用 `--disable-pip --require-hashes`，让审计器直接检查显式清单。`--disable-pip` 本身不证明依赖闭包完整；完整性由干净环境的带哈希安装、`pip check` 和下列集合对比共同验证。[pip-audit 使用说明](https://github.com/pypa/pip-audit#usage)
 
-审计工具必须放在独立环境，固定 `pip-audit==2.10.1`。以下命令假定 `$auditPython` 指向该环境、`$appPython` 指向前述新测试环境：
+审计工具必须放在独立环境，先安装 `installer.txt` 再安装完整 `toolchain-windows-py312.txt` 哈希锁，不能仅安装直接工具版本。见[工具链锁说明](toolchain-locks-2026-10-03.md)。以下命令假定 `$auditPython` 指向该环境、`$appPython` 指向前述新测试环境：
 
 ```powershell
 New-Item -ItemType Directory -Force output | Out-Null
@@ -56,7 +57,7 @@ New-Item -ItemType Directory -Force output | Out-Null
 
 ## 维护与更新
 
-生成器要求 Windows CPython 3.12 AMD64、`pip==26.2.1` 和 `pip-tools==7.6.1`。单独创建维护环境，先安装安装器锁，再从官方 PyPI 安装固定版本的 pip-tools。生成器清除继承的 pip 源、额外源、约束和本机配置，使用相对输入路径与固定的文件头命令，避免把本机路径或私有索引写进锁文件。
+生成器要求 Windows CPython 3.12 AMD64、`pip==26.2.1` 和 `pip-tools==7.6.1`，并检查整个维护环境与工具/安装器锁逐包一致。单独创建维护环境，先安装安装器锁，再安装完整工具链锁；早期仅安装 pip-tools 的示例已经被替代。生成器清除继承的 pip 源、额外源、约束和本机配置，使用相对输入路径与固定的文件头命令，避免把本机路径或私有索引写进锁文件。
 
 解释器、平台或工具版本不符合上述要求时，生成脚本以非零状态退出并说明要求，不静默生成其他平台的锁。安装器锁中 pip 26.2.1 wheel 的 SHA-256 来自官方发布元数据；本轮也单独通过 pip-audit 查询该版本，未发现已知漏洞。该结论仅对应本次查询日期，后续仍须持续审计和升级。[pip 26.2.1 官方元数据](https://pypi.org/pypi/pip/26.2.1/json)
 
@@ -64,7 +65,7 @@ New-Item -ItemType Directory -Force output | Out-Null
 py -3.12 -m venv output/python-lock-tools
 $lockPython = 'output/python-lock-tools/Scripts/python.exe'
 & $lockPython -m pip --isolated install --disable-pip-version-check --require-hashes --only-binary=:all: --index-url https://pypi.org/simple -r requirements/locks/installer.txt
-& $lockPython -m pip --isolated install --disable-pip-version-check --only-binary=:all: --index-url https://pypi.org/simple pip-tools==7.6.1
+& $lockPython -m pip --isolated install --disable-pip-version-check --require-hashes --only-binary=:all: --index-url https://pypi.org/simple -r requirements/locks/toolchain-windows-py312.txt
 & $lockPython scripts/lock_python_dependencies.py
 # 需要主动更新传递依赖时，再使用：
 & $lockPython scripts/lock_python_dependencies.py --upgrade
@@ -87,7 +88,7 @@ $lockPython = 'output/python-lock-tools/Scripts/python.exe'
 - 测试锁、实际环境和应用审计清单的 29 个包逐项一致；安装器 pip 另审计 1 包；均无跳过、无已知漏洞。
 - 用错误的合成 SHA-256 执行真实 pip 安装预演，确认下载被拒绝。
 - 验证器 14 项回归通过，包含漏审 packaging、版本漂移、重复别名、错误哈希格式、跳过包、安装器遗漏和真实 CLI 退出码检查。
-- 生成工具与 pip-audit 自身的全部传递依赖尚未建立独立哈希锁；它们与应用环境隔离，但仍是后续供应链治理事项。模型环境及操作系统/解释器安全补丁验收也不包含在这些结果中。
+- 此初始批次未锁生成工具与 pip-audit 自身的全部传递依赖；后续已经补齐独立工具链哈希锁及安装/审计集合校验，见[后续验收](toolchain-locks-2026-10-03.md)。模型环境及操作系统/解释器安全补丁验收仍不包含在这些结果中。
 
 原始安装报告、审计 JSON、生成缓存和诊断输出仅留在被忽略的 `output/`，不随源码提交。
 

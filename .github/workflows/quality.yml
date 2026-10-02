@@ -67,7 +67,7 @@ jobs:
       - name: Check Python dependency compatibility
         run: python -m pip check
 
-      - name: Install pinned Python audit tool in an isolated environment
+      - name: Install hashed Python maintainer tools in an isolated environment
         shell: pwsh
         run: |
           $pythonAuditEnv = Join-Path $env:RUNNER_TEMP 'idm-python-audit'
@@ -76,18 +76,28 @@ jobs:
           $pythonAudit = Join-Path $pythonAuditEnv 'Scripts/python.exe'
           & $pythonAudit -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/installer.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $pythonAudit -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: pip-audit==2.10.1
+          & $pythonAudit -m pip --isolated install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: --require-hashes -r requirements/locks/toolchain-windows-py312.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonAudit -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Audit every locked Python package and installer
+      - name: Audit and verify every tool, installer and application package
         shell: pwsh
         run: |
           $pythonAudit = Join-Path $env:RUNNER_TEMP 'idm-python-audit/Scripts/python.exe'
           $applicationAudit = Join-Path $env:RUNNER_TEMP 'idm-application-audit.json'
           $installerAudit = Join-Path $env:RUNNER_TEMP 'idm-installer-audit.json'
-          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/test-windows-py312.txt --vulnerability-service pypi --progress-spinner off --format json --output $applicationAudit
+          $toolchainAudit = Join-Path $env:RUNNER_TEMP 'idm-toolchain-audit.json'
+          $auditCache = Join-Path $env:RUNNER_TEMP 'idm-python-audit-cache'
+          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/toolchain-windows-py312.txt --vulnerability-service pypi --cache-dir $auditCache --progress-spinner off --format json --output $toolchainAudit
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/installer.txt --vulnerability-service pypi --progress-spinner off --format json --output $installerAudit
+          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/installer.txt --vulnerability-service pypi --cache-dir $auditCache --progress-spinner off --format json --output $installerAudit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonAudit scripts/verify_python_dependencies.py --lock requirements/locks/toolchain-windows-py312.txt --installer-lock requirements/locks/installer.txt --input requirements/locks/toolchain.in --audit $toolchainAudit --installer-audit $installerAudit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonAudit -c "from scripts.lock_python_dependencies import validate_generator; validate_generator()"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $pythonAudit -m pip_audit --strict --disable-pip --require-hashes -r requirements/locks/test-windows-py312.txt --vulnerability-service pypi --cache-dir $auditCache --progress-spinner off --format json --output $applicationAudit
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/verify_python_dependencies.py --lock requirements/locks/test-windows-py312.txt --installer-lock requirements/locks/installer.txt --runtime-lock requirements/locks/runtime-windows-py312.txt --input requirements-test.txt --audit $applicationAudit --installer-audit $installerAudit
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
