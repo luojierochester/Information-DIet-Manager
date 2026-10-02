@@ -15,19 +15,21 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
+    from .algorithms.evaluator import InformationQualityEvaluator
 
 CURRENT_DIR = Path(__file__).resolve().parent
 ALGORITHMS_DIR = CURRENT_DIR / "algorithms"
-if str(ALGORITHMS_DIR) not in sys.path:
-    sys.path.insert(0, str(ALGORITHMS_DIR))
 
-from algorithms.evaluator import InformationQualityEvaluator
-from algorithms.sentiment import SentimentAnalyzer
-from algorithms.classifier import ContentClassifier
-from algorithms.similarity import SimilarityAnalyzer
+def _ensure_algorithm_import_path() -> None:
+    # Algorithm modules use sibling imports. Resolve them only when execution
+    # needs optional dependencies, consistently with the API analysis pipeline.
+    if str(ALGORITHMS_DIR) not in sys.path:
+        sys.path.insert(0, str(ALGORITHMS_DIR))
+
 
 def load_json_payload(input_file: Optional[str]) -> Dict[str, Any]:
     """支持从文件或标准输入读取 JSON。"""
@@ -79,6 +81,8 @@ def load_input_data(input_file: Optional[str], input_format: str) -> Union[Dict[
     if actual_format == "csv":
         if not input_file:
             raise ValueError("CSV 输入必须通过 --input_file 指定文件路径。")
+        import pandas as pd
+
         return pd.read_csv(input_file)
 
     return load_json_payload(input_file)
@@ -117,6 +121,8 @@ def normalize_payload(payload: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any
 
 def normalize_dataframe_input(df: pd.DataFrame) -> pd.DataFrame:
     """标准化 CSV / DataFrame 输入。"""
+    import pandas as pd
+
     if not isinstance(df, pd.DataFrame):
         raise TypeError("CSV 输入必须可转换为 DataFrame。")
     if df.empty:
@@ -141,6 +147,8 @@ def normalize_dataframe_input(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_input_data(payload: Union[Dict[str, Any], List[Dict[str, Any]], pd.DataFrame]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """统一标准化 JSON / CSV 输入。"""
+    import pandas as pd
+
     if isinstance(payload, pd.DataFrame):
         return normalize_dataframe_input(payload), {}
 
@@ -150,6 +158,8 @@ def normalize_input_data(payload: Union[Dict[str, Any], List[Dict[str, Any]], pd
 
 def build_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     """前端 records 数组转 DataFrame。"""
+    import pandas as pd
+
     df = pd.DataFrame(records)
     if "url" not in df.columns:
         df["url"] = ""
@@ -166,6 +176,12 @@ def run_full_pipeline(
     detailed: bool,
 ) -> Tuple[Dict[str, Any], Any, InformationQualityEvaluator]:
     """原始数据全流程：分类 -> 情感 -> 相似度 -> 评估。"""
+    _ensure_algorithm_import_path()
+    from classifier import ContentClassifier
+    from evaluator import InformationQualityEvaluator
+    from sentiment import SentimentAnalyzer
+    from similarity import SimilarityAnalyzer
+
     sentiment_analyzer = SentimentAnalyzer(use_bert=False)
     if sentiment_model_path:
         sentiment_analyzer.load_model(sentiment_model_path)
@@ -206,6 +222,9 @@ def run_full_pipeline(
 
 def run_evaluate_only(df: pd.DataFrame, *, detailed: bool) -> Tuple[Dict[str, Any], Any, InformationQualityEvaluator]:
     """已包含 category/sentiment/polarity/similarity 的结果直接评估。"""
+    _ensure_algorithm_import_path()
+    from evaluator import InformationQualityEvaluator
+
     evaluator = InformationQualityEvaluator()
     report = evaluator.evaluate(df, detailed=detailed)
     result = {
