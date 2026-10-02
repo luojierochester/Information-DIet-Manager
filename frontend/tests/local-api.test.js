@@ -45,3 +45,22 @@ test('revoked server key clears the established session', async () => {
   await assert.rejects(api.get('/items'), /HTTP_401/)
   await assert.rejects(api.get('/items'), /NOT_PAIRED/)
 })
+
+test('only the known snapshot conflict exposes a recovery code; arbitrary server text stays private', async () => {
+  let detail = { code: 'items_snapshot_expired', message: 'private server diagnostic' }
+  const api = createLocalApi('http://localhost:8000', async url => url.endsWith('/session')
+    ? ok({ role: 'admin' }) : Response.json({ detail }, { status: 409 }))
+  await api.pair(key)
+  await assert.rejects(api.get('/items'), error => error.message === 'HTTP_409'
+    && error.code === 'items_snapshot_expired' && !JSON.stringify(error).includes('private'))
+  detail = { code: 'unknown_error', message: key }
+  await assert.rejects(api.get('/items'), error => error.message === 'HTTP_409'
+    && error.code === undefined && !JSON.stringify(error).includes(key))
+})
+
+test('a non-JSON conflict remains a bounded HTTP error', async () => {
+  const api = createLocalApi('http://localhost:8000', async url => url.endsWith('/session')
+    ? ok({ role: 'admin' }) : new Response('conflict', { status: 409 }))
+  await api.pair(key)
+  await assert.rejects(api.get('/items'), { message: 'HTTP_409' })
+})

@@ -34,7 +34,13 @@ export function createLocalApi(base, fetchImpl = fetch) {
       })
       if (!response.ok) {
         if (response.status === 401 && epoch === generation) disconnect()
-        throw new Error('HTTP_' + response.status)
+        const error = new Error('HTTP_' + response.status)
+        // Only expose this public recovery signal, never arbitrary server text.
+        if (response.status === 409) {
+          const problem = await response.json().catch(() => null)
+          if (problem?.detail?.code === 'items_snapshot_expired') error.code = 'items_snapshot_expired'
+        }
+        throw error
       }
       const result = options.responseType === 'blob' ? await response.blob() : await response.json()
       if (epoch !== generation) throw new DOMException('Session changed', 'AbortError')

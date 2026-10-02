@@ -51,6 +51,22 @@ jobs:
       - name: Check Python dependency compatibility
         run: python -m pip check
 
+      - name: Install pinned Python audit tool in an isolated environment
+        shell: pwsh
+        run: |
+          $pythonAuditEnv = Join-Path $env:RUNNER_TEMP 'idm-python-audit'
+          python -m venv $pythonAuditEnv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $pythonAuditEnv 'Scripts/python.exe') -m pip install --disable-pip-version-check --index-url https://pypi.org/simple pip-audit==2.10.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Audit the complete minimal Python dependency tree
+        shell: pwsh
+        run: |
+          $pythonAudit = Join-Path $env:RUNNER_TEMP 'idm-python-audit/Scripts/python.exe'
+          & $pythonAudit -m pip_audit --strict -r requirements-test.txt --index-url https://pypi.org/simple --vulnerability-service pypi --progress-spinner off --format json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run API and algorithm contract tests
         run: python -m pytest src/hyh/tests src/lsj/tests -q
 
@@ -60,6 +76,10 @@ jobs:
       - name: Install extension browser test tools
         working-directory: chrome-extension
         run: npm ci
+
+      - name: Audit all extension dependencies against the official registry
+        working-directory: chrome-extension
+        run: npm audit --package-lock-only --include=dev --include=optional --include=peer --audit-level=low --registry=https://registry.npmjs.org
 
       - name: Install isolated Chromium test browser
         working-directory: chrome-extension
@@ -72,6 +92,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: Audit all frontend dependencies against the official registry
+        working-directory: frontend
+        run: npm audit --package-lock-only --include=dev --include=optional --include=peer --audit-level=low --registry=https://registry.npmjs.org
 
       - name: Run frontend tests
         working-directory: frontend

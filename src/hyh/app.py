@@ -17,14 +17,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .db import get_conn, init_db
-from .models import IngestAck, IngestItem
+from .models import IngestAck, IngestItem, MAX_INGEST_TS
 from .utils import normalize_text, normalize_url, sha256_hex
 from . import db
 from .security import LocalAccessMiddleware, LocalSecurity, process_ownership
 from .data_management import install_data_routes
+from .item_pagination import read_cursor_page
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -327,10 +328,6 @@ def _normalize_channel_counts(counts: Optional[Dict[str, Any]]) -> Optional[Dict
     return {key: normalized.get(key, 0) for key in CHANNEL_CANONICAL_KEYS}
 
 
-def _round_metric(value: Any) -> float:
-    return round(float(value or 0.0), 6)
-
-
 def _default_visualization_payload() -> Dict[str, Any]:
     return {
         "time_series": [],
@@ -409,7 +406,7 @@ def _execute_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
 
         df1 = classifier.batch_predict(
-            df[["title", "url", "analysis_text", "channel", "ts"]].copy()
+            df[["id", "title", "url", "analysis_text", "channel", "ts"]].copy()
         )
         df2 = sentiment.batch_predict(
             df1, text_column="analysis_text", include_emotions=False, batch_size=500
@@ -444,70 +441,6 @@ def _execute_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         }
 
 
-def _build_daily_metric_rows(df: Any) -> List[Dict[str, Any]]:
-    if df.empty or "timestamp" not in df.columns:
-        return []
-
-    work = df.dropna(subset=["timestamp"]).copy()
-    if work.empty:
-        return []
-
-    work["date"] = work["timestamp"].dt.date.astype(str)
-    work["is_negative"] = (work["sentiment"] == "negative").astype(float)
-    work["is_positive"] = (work["sentiment"] == "positive").astype(float)
-    work["is_neutral"] = (work["sentiment"] == "neutral").astype(float)
-    work["is_repeat"] = (
-        work["similarity"].astype(float) >= DEFAULT_REPEAT_THRESHOLD
-    ).astype(float)
-
-    daily = (
-        work.groupby("date")
-        .agg(
-            count=("title", "count"),
-            avg_polarity=("polarity", "mean"),
-            avg_similarity=("similarity", "mean"),
-            repeat_ratio=("is_repeat", "mean"),
-            negative_ratio=("is_negative", "mean"),
-            positive_ratio=("is_positive", "mean"),
-            neutral_ratio=("is_neutral", "mean"),
-        )
-        .reset_index()
-        .sort_values(by="date")
-    )
-
-    rows: List[Dict[str, Any]] = []
-    for item in daily.to_dict("records"):
-        rows.append(
-            {
-                "date": str(item["date"]),
-                "count": int(item["count"]),
-                "avg_polarity": _round_metric(item["avg_polarity"]),
-                "avg_similarity": _round_metric(item["avg_similarity"]),
-                "repeat_ratio": _round_metric(item["repeat_ratio"]),
-                "negative_ratio": _round_metric(item["negative_ratio"]),
-                "positive_ratio": _round_metric(item["positive_ratio"]),
-                "neutral_ratio": _round_metric(item["neutral_ratio"]),
-            }
-        )
-    return rows
-
-
-def _build_category_visualization(df: Any) -> Dict[str, Any]:
-    if df.empty or "category" not in df.columns:
-        return {}
-
-    categories: Dict[str, Any] = {}
-    for category, group in df.groupby("category"):
-        key = _normalize_category_key(category)
-        categories[key] = {
-            "alias": CATEGORY_ALIAS_MAP.get(key, key),
-            "label": str(category),
-            "time_series": _build_daily_metric_rows(group),
-        }
-
-    return dict(sorted(categories.items(), key=lambda item: item[0]))
-
-
 def _build_visualization_result(
     rows: List[Dict[str, Any]],
     *,
@@ -534,33 +467,30 @@ def _build_visualization_result(
         base["pipeline_warning"] = execution.get("warning")
         return base
 
-    if int(execution.get("input_count") or 0) == 0:
-        base["analysis_status"] = "empty"
-        return base
-
-    evaluator = execution["evaluator"]
-    df3 = execution["df3"]
     try:
-        processed = evaluator._preprocess_data(df3)
-        global_payload = evaluator.get_visualization_data(df3)
-        global_payload["time_series"] = _build_daily_metric_rows(processed)
-        categories = _build_category_visualization(processed)
-        category_counts = {
-            str(key): int(count)
-            for key, count in processed["category"].value_counts().items()
-        }
+        from .visualization_metrics import build_visualization_metrics
+
+        df3 = execution["df3"]
+        # Adjacent-pair results only describe the original (ts, id) sequence.
+        # A pipeline that drops or reorders rows must not silently relabel them.
+        if (len(df3) != len(rows) or df3["id"].tolist() != [r["id"] for r in rows]
+                or df3["ts"].tolist() != [r["ts"] for r in rows]):
+            raise ValueError("Pipeline record alignment changed")
+        metrics = build_visualization_metrics(
+            df3, repeat_threshold=DEFAULT_REPEAT_THRESHOLD, category_aliases=CATEGORY_ALIAS_MAP,
+        )
     except Exception:
         # Do not turn a failed metric computation into zeroes or a successful chart.
         base["analysis_status"] = "failed"
         base["pipeline_warning"] = "visualization computation failed"
         return base
 
-    base["window"]["input_count"] = int(execution["input_count"])
-    base["window"]["processed_count"] = int(len(processed))
+    base["window"]["processed_count"] = metrics["processed_count"]
     base["analysis_status"] = "ready"
-    base["global"] = global_payload
-    base["categories"] = categories
-    base["category_counts"] = category_counts
+    base["global"] = metrics["global"]
+    base["categories"] = metrics["categories"]
+    base["category_counts"] = metrics["category_counts"]
+    base["coverage"] = metrics["coverage"]
     return base
 
 
@@ -1063,6 +993,7 @@ async def lifespan(_app: FastAPI):
     with process_ownership(db.DB_PATH):
         _app.state.security = LocalSecurity.load(db.DB_PATH)
         _app.state.operation_lock = asyncio.Lock()
+        _app.state.analysis_lock = asyncio.Lock()
         _app.state.request_slots = asyncio.Semaphore(4)
         init_db(_schema_path())
         yield
@@ -1136,16 +1067,29 @@ def list_items(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     limit: Optional[int] = Query(None, ge=1, le=200),
+    pagination: str = Query("offset", pattern="^(offset|cursor)$"),
+    cursor: Optional[str] = Query(None, min_length=1, max_length=2048),
 ) -> Dict[str, Any]:
+    if cursor is not None and pagination != "cursor":
+        raise HTTPException(400, detail="A cursor requires pagination=cursor.")
+    if pagination == "cursor" and (page != 1 or limit is not None):
+        raise HTTPException(400, detail="Cursor pagination uses page_size and cursor only.")
     if limit is not None:
         page_size = limit
     offset = (page - 1) * page_size
     with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) AS cnt FROM items").fetchone()["cnt"]
-        rows = conn.execute(
-            "SELECT * FROM items ORDER BY id DESC LIMIT ? OFFSET ?",
-            (page_size, offset),
-        ).fetchall()
+        conn.execute("BEGIN")
+        if pagination == "cursor":
+            rows, metadata = read_cursor_page(conn, page_size=page_size, cursor=cursor)
+        else:
+            # Legacy page-number clients retain their contract, but each count
+            # and page now share a SQLite snapshot within this request.
+            total = conn.execute("SELECT COUNT(*) AS cnt FROM items").fetchone()["cnt"]
+            rows = conn.execute(
+                "SELECT * FROM items ORDER BY id DESC LIMIT ? OFFSET ?",
+                (page_size, min(offset, 2**63 - 1)),
+            ).fetchall()
+            metadata = {"page": page, "page_size": page_size, "total": total}
     items: List[Dict[str, Any]] = []
     for row in rows:
         item: Dict[str, Any] = dict(row)
@@ -1160,7 +1104,7 @@ def list_items(
             except json.JSONDecodeError:
                 item["meta"] = None
         items.append(item)
-    return {"page": page, "page_size": page_size, "total": total, "items": items}
+    return {**metadata, "items": items}
 
 
 @app.post("/analyze/run")
@@ -1505,6 +1449,17 @@ def run_full_analysis(
                 "cached": False,
                 "result": payload,
             }
+        except ValueError:
+            # Legacy scoring still requires complete rows. Missing measurements
+            # (including the first row's predecessor) are not synthetic zeroes.
+            # Persist an explicit rejected job rather than turning this expected
+            # validation outcome into HTTP 500 or a fabricated successful score.
+            message = "Legacy scoring lacks complete valid measurements; use /dashboard/visualization for partial statistics."
+            _update_analysis_job(
+                conn, job_id, status=JOB_FAILED, error=message,
+                duration_ms=_now_ms() - started_at, finished_at=_now_ms(),
+            )
+            return JSONResponse(status_code=422, content={"job_id": job_id, "status": JOB_FAILED, "detail": message})
         except Exception as exc:
             duration_ms = _now_ms() - started_at
             err_detail = f"{exc}\n{traceback.format_exc(limit=5)}"
@@ -1571,11 +1526,27 @@ def dashboard_summary() -> Dict[str, Any]:
 
 
 # 以下路由用于“后端->逻辑”的接口
+def _require_analysis_revision(conn: Any, expected: Dict[str, Any], *, job_id: Optional[int] = None) -> None:
+    actual = dict(conn.execute("SELECT database_id, revision FROM items_revision WHERE singleton = 1").fetchone())
+    if actual != expected:
+        if job_id is not None:
+            # A delete/restore may already have removed this job: UPDATE never
+            # recreates it. Direct external updates can leave it present; finish
+            # that job before raising so it cannot remain RUNNING indefinitely.
+            _update_analysis_job(conn, job_id, status=JOB_FAILED,
+                                 error="analysis snapshot expired", finished_at=_now_ms())
+            conn.commit()
+        raise HTTPException(409, detail={
+            "code": "analysis_snapshot_expired",
+            "message": "Records changed during analysis; run analysis again.",
+        })
+
+
 @app.get("/dashboard/visualization")
 def dashboard_visualization(
     days: int = Query(DEFAULT_VIS_DAYS, ge=1, le=90),
-    from_ts: Optional[int] = Query(None),
-    to_ts: Optional[int] = Query(None),
+    from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
+    to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=50000),
     force: bool = Query(False),
 ) -> Dict[str, Any]:
@@ -1591,6 +1562,8 @@ def dashboard_visualization(
         if from_ts is not None
         else max(0, resolved_to_ts - days * 24 * 60 * 60 * 1000)
     )
+    if resolved_from_ts > resolved_to_ts:
+        raise HTTPException(400, detail="from_ts cannot be greater than the resolved to_ts")
 
     day = datetime.now(timezone.utc).date().isoformat()
     with get_conn() as conn:
@@ -1601,8 +1574,9 @@ def dashboard_visualization(
             (resolved_from_ts, resolved_to_ts),
         ).fetchone()[0]
         item_state = conn.execute(
-            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at FROM items"
+            "SELECT COALESCE(MAX(created_at), 0) AS max_created_at, COALESCE(MAX(id), 0) AS max_id FROM items"
         ).fetchone()
+        revision = dict(conn.execute("SELECT database_id, revision FROM items_revision WHERE singleton = 1").fetchone())
         max_created_at = int(item_state["max_created_at"] or 0)
         rows = _load_items_for_analysis(
             conn,
@@ -1613,16 +1587,20 @@ def dashboard_visualization(
         input_count = len(rows)
         job_key = {
             "days": days,
-            "from_ts": from_ts,
-            "to_ts": to_ts,
+            "from_ts": resolved_from_ts,
+            "to_ts": resolved_to_ts,
             "limit_rows": limit_rows,
             "mode": "dashboard_visualization",
-            "schema_version": 2,
+            "schema_version": 3,
+            "data_revision": revision,
+            "max_id": int(item_state["max_id"]),
         }
         input_hash = _stable_hash_payload(job_key)
 
     # Release the read snapshot before writing job/cache metadata.
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_analysis_revision(conn, revision)
         if not force:
             cached = conn.execute(
                 """
@@ -1688,16 +1666,22 @@ def dashboard_visualization(
             input_count=input_count,
             cache_hit=False,
         )
-        started_at = _now_ms()
-        payload = _build_visualization_result(
-            rows,
-            from_ts=resolved_from_ts,
-            to_ts=resolved_to_ts,
-            limit_rows=limit_rows,
-        )
-        payload["window"]["available_count"] = int(available_count)
-        payload["window"]["truncated"] = available_count > len(rows)
-        payload["cached"] = False
+
+    # Optional inference must not hold SQLite's writer lock and block collection
+    # or deletion. Destructive changes invalidate the result before publication.
+    started_at = _now_ms()
+    payload = _build_visualization_result(
+        rows,
+        from_ts=resolved_from_ts,
+        to_ts=resolved_to_ts,
+        limit_rows=limit_rows,
+    )
+    payload["window"]["available_count"] = int(available_count)
+    payload["window"]["truncated"] = available_count > len(rows)
+    payload["cached"] = False
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_analysis_revision(conn, revision, job_id=job_id)
         _update_analysis_job(
             conn,
             job_id,

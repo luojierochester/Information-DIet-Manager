@@ -224,7 +224,7 @@ def test_partial_restore_storage_failure_rolls_back_deletion_and_new_embeddings(
     assert snapshot() == before
 
 
-def test_delete_waits_for_inflight_analysis_and_clears_its_late_output(client, monkeypatch):
+def test_delete_completes_during_analysis_and_prevents_its_late_output(client, monkeypatch):
     seed(client, 5)
     entered, release = threading.Event(), threading.Event()
     def slow_analysis(rows):
@@ -235,10 +235,37 @@ def test_delete_waits_for_inflight_analysis_and_clears_its_late_output(client, m
         analysis = pool.submit(client.get, "/dashboard/visualization?from_ts=1790208000000&to_ts=1790294400000", headers=ADMIN)
         assert entered.wait(5)
         delete = pool.submit(client.delete, "/data", headers={**ADMIN, "X-IDM-Confirm": "delete-all"})
-        release.set()
-        assert analysis.result().status_code == 200
-        assert delete.result().status_code == 200
+        try:
+            assert delete.result(timeout=3).status_code == 200
+        finally:
+            release.set()
+        assert analysis.result().status_code == 409
     assert all(not rows for rows in snapshot().values())
+
+
+def test_busy_dashboard_analysis_does_not_block_records_and_keeps_protected_error_headers(client):
+    gate = api.app.state.analysis_lock
+    client.portal.call(gate.acquire)
+    try:
+        response = client.get("/dashboard/visualization", headers={**ADMIN, "Origin": ORIGIN})
+        assert response.status_code == 503 and response.headers["Retry-After"] == "5"
+        assert response.headers["Access-Control-Allow-Origin"] == ORIGIN
+        assert response.headers["Cache-Control"] == "no-store"
+        assert client.get("/items", headers=ADMIN).status_code == 200
+        assert client.post("/analyze/run_full", headers=ADMIN).status_code == 503
+        assert not api.app.state.operation_lock.locked()
+    finally:
+        client.portal.call(gate.release)
+
+
+def test_legacy_scoring_releases_model_lock_when_data_gate_times_out(client):
+    gate = api.app.state.operation_lock
+    client.portal.call(gate.acquire)
+    try:
+        assert client.post("/analyze/run_full", headers=ADMIN).status_code == 503
+        assert not api.app.state.analysis_lock.locked()
+    finally:
+        client.portal.call(gate.release)
 
 
 def test_second_process_cannot_open_same_database(client):

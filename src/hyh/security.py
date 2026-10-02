@@ -237,14 +237,21 @@ class LocalAccessMiddleware:
                     return {"type": "http.request", "body": bytes(body), "more_body": False}
                 return await receive()
 
-            # Serialize completed data operations, including analysis, deletion and restoration.
-            # A process lock prevents a second API worker from bypassing this boundary.
-            gate = scope["app"].state.operation_lock
-            try:
-                await asyncio.wait_for(gate.acquire(), timeout=2)
-            except TimeoutError:
-                return await JSONResponse({"detail": "Service busy; retry later"}, status_code=503,
-                                          headers={"Retry-After": "5"})(scope, receive, protected_send)
+            # Dashboard analysis has transactional version checks before and
+            # after inference. Keep it single-flight without blocking collection
+            # and recovery for the duration of optional model loading/inference.
+            # Other data operations retain their shared ordering boundary.
+            state = scope["app"].state
+            if scope["path"] == "/dashboard/visualization":
+                gates = [state.analysis_lock]
+            elif scope["path"] == "/analyze/run_full":
+                # The legacy scorer still needs the data-operation lock. Take
+                # the shared model lock first so competing model requests do
+                # not load a second model or hold the data lock while waiting.
+                gates = [state.analysis_lock, state.operation_lock]
+            else:
+                gates = [state.operation_lock]
+            acquired = []
             response_started = False
 
             async def operation_send(message):
@@ -254,15 +261,24 @@ class LocalAccessMiddleware:
                 await protected_send(message)
 
             try:
-                await self.app(scope, buffered_receive, operation_send)
-            except Exception as error:
-                if response_started:
-                    raise
-                # Keep failures inside the CORS/no-store boundary without reflecting private data.
-                logging.getLogger("uvicorn.error").error("Local data operation failed (%s)", type(error).__name__)
-                await JSONResponse({"detail": "Local data operation failed"}, status_code=500)(scope, buffered_receive, protected_send)
+                try:
+                    for gate in gates:
+                        await asyncio.wait_for(gate.acquire(), timeout=2)
+                        acquired.append(gate)
+                except TimeoutError:
+                    return await JSONResponse({"detail": "Service busy; retry later"}, status_code=503,
+                                              headers={"Retry-After": "5"})(scope, receive, protected_send)
+                try:
+                    await self.app(scope, buffered_receive, operation_send)
+                except Exception as error:
+                    if response_started:
+                        raise
+                    # Keep failures inside the CORS/no-store boundary without reflecting private data.
+                    logging.getLogger("uvicorn.error").error("Local data operation failed (%s)", type(error).__name__)
+                    await JSONResponse({"detail": "Local data operation failed"}, status_code=500)(scope, buffered_receive, protected_send)
             finally:
-                gate.release()
+                for gate in reversed(acquired):
+                    gate.release()
 
         cors = CORSMiddleware(authorized, allow_origins=list(security.origins), allow_origin_regex=EXTENSION_ORIGIN,
                               allow_methods=["GET", "POST", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-IDM-Confirm"],

@@ -11,7 +11,7 @@ const { chromium } = require('../../chrome-extension/node_modules/playwright');
 const root = path.resolve(__dirname, '../..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'idm-lifecycle-e2e-'));
 const dist = path.join(temp, 'dist');
-const artifacts = path.join(root, 'output/playwright/ui-restoration');
+const artifacts = path.join(root, 'output/playwright/display-correctness');
 fs.mkdirSync(artifacts, { recursive: true });
 const admin = randomBytes(32).toString('base64url'), collector = randomBytes(32).toString('base64url');
 const headers = { Authorization: 'Bearer ' + admin };
@@ -159,6 +159,7 @@ async function run() {
   const visualizationFixture = {
     analysis_status: 'ready', minimum_records: 5, generated_at: Date.UTC(2026, 8, 24, 23, 59),
     window: { from_ts: Date.UTC(2026, 8, 22), to_ts: Date.UTC(2026, 8, 24, 23, 59), input_count: 56, available_count: 56, processed_count: 56, truncated: false },
+    coverage: { record_count: 56, timestamp_count: 56, category_count: 56, comparison_count: 48, sentiment_count: 52 },
     category_counts: Object.fromEntries(fixtureCategories.map(key => [key, 8])),
     global: { time_series: fixtureRows(28) },
     categories: Object.fromEntries(fixtureCategories.map(key => [key, { time_series: fixtureRows(4) }])),
@@ -168,6 +169,10 @@ async function run() {
   await page.route(api + '/dashboard/visualization?**', route => route.fulfill({ json: visualizationFixture }));
   await hideSettings(); await page.getByTestId('run-analysis').click();
   await until(async () => (await page.getByTestId('analysis-status').textContent()).includes('实验统计已生成'), 'fixture analysis rendering');
+  const coverageText = await page.getByTestId('analysis-status').textContent();
+  assert.ok(coverageText.includes('分类有效 56/56 条') && coverageText.includes('情感有效 52/56 条')
+    && coverageText.includes('日期有效 56/56 条') && coverageText.includes('相邻比较有效 48/55 对')
+    && coverageText.includes('后一条记录的 UTC 日期和分类归属'));
   await until(async () => (await canvasImages()).every((image, index) => image && image !== emptyCanvases[index]), 'all four charts paint the supplied fixture');
   assert.equal(await page.locator('.chart-container canvas').count(), 4);
   assert.equal(await page.locator('.dashboard-grid h2').count(), 4);
@@ -175,7 +180,7 @@ async function run() {
   await page.screenshot({ path: path.join(artifacts, 'fixture-ready-charts.png'), fullPage: true });
   await page.unroute(api + '/dashboard/visualization?**');
   await showSettings();
-  pass('synthetic analysis fixture renders all four charts with seven categories, zero values and a missing date; this does not verify model inference');
+  pass('synthetic analysis fixture renders all four charts and independent metric coverage with the UTC later-record comparison definition; this does not verify model inference');
 
   const downloadPromise = page.waitForEvent('download'); await page.getByTestId('backup').click();
   const download = await downloadPromise, backupPath = path.join(temp, 'backup.json'); await download.saveAs(backupPath);
@@ -267,11 +272,109 @@ async function run() {
   await hideSettings();
   await page.getByTestId('records-toggle').click();
   await until(async () => await page.getByTestId('record-row').count() === 50, 'first drawer page');
+  const expectedSnapshotUrls = (await (await fetch(api + '/items?page_size=200', { headers })).json()).items.map(item => item.url);
+  const paginationBackup = await (await fetch(api + '/data/backup', { headers })).json();
+  const snapshotStatus = await page.getByTestId('records-status').textContent();
+  const arrivalUrl = 'https://example.invalid/new-during-pagination';
+  const arrivalResponse = await fetch(api + '/collect', { method: 'POST', headers: { Authorization: 'Bearer ' + collector, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: arrivalUrl, title: 'New arrival during pagination', text: 'Synthetic arrival', ts: Date.now(), source: 'plugin' }) });
+  assert.equal(arrivalResponse.status, 200); assert.equal((await arrivalResponse.json()).inserted, 1);
   await page.getByTestId('load-more').click();
   await until(async () => await page.getByTestId('record-row').count() === 53, 'second drawer page');
+  assert.equal(await savedTotal.textContent(), '53', 'New arrivals must not alter the current snapshot total');
+  assert.equal(await page.getByTestId('records-status').textContent(), snapshotStatus, 'All pages retain the first snapshot timestamp');
   assert.equal(await page.getByTestId('load-more').count(), 0);
-  const recordUrls = await page.getByTestId('record-row').locator('a').evaluateAll(links => links.map(link => link.href));
+  const displayedUrls = () => page.getByTestId('record-row').locator('a').evaluateAll(links => links.map(link => link.href));
+  const recordUrls = await displayedUrls();
   assert.equal(recordUrls.length, 53); assert.equal(new Set(recordUrls).size, 53);
+  assert.deepEqual(recordUrls, expectedSnapshotUrls);
+  assert.equal(recordUrls.includes(arrivalUrl), false);
+  pass('concurrent collection leaves every original snapshot record visible exactly once with a consistent total and end-of-pages state');
+  await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
+  await page.getByTestId('records-toggle').click();
+  await until(async () => await savedTotal.textContent() === '54' && await page.getByTestId('record-row').count() === 50, 'new arrival after reopening');
+  assert.equal((await displayedUrls())[0], arrivalUrl);
+  pass('reopening the drawer starts a fresh snapshot and shows arrivals excluded from the previous one');
+
+  // Hold an analysis response while another client changes the records. The
+  // snapshot recovery must cancel and invalidate this older analysis request.
+  await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
+  let releaseOldAnalysis;
+  await page.route(api + '/dashboard/visualization?**', async route => {
+    await new Promise(resolve => { releaseOldAnalysis = resolve; });
+    await route.fulfill({ json: visualizationFixture }).catch(() => {});
+  });
+  await page.getByTestId('run-analysis').click();
+  await until(() => Boolean(releaseOldAnalysis), 'held analysis request');
+  // Keyboard navigation remains available during the visual loading overlay;
+  // the record drawer sits above it and can still request its next page.
+  await page.keyboard.press('Tab');
+  assert.equal(await page.getByTestId('records-toggle').evaluate(element => document.activeElement === element), true);
+  await page.keyboard.press('Enter');
+  await drawer.waitFor({ state: 'visible' });
+  await until(async () => await page.getByTestId('record-row').count() === 50 && !(await page.getByTestId('load-more').isDisabled()), 'drawer available during pending analysis');
+
+  // A second management client deletes an already-loaded row. The pending
+  // cursor must expire, and the browser must replace rather than append pages.
+  const arrival = (await (await fetch(api + '/items?page_size=200', { headers })).json()).items.find(item => item.url === arrivalUrl);
+  const externalDelete = await fetch(api + '/items/' + arrival.id, { method: 'DELETE', headers: { ...headers, 'X-IDM-Confirm': 'delete-record' } });
+  assert.equal(externalDelete.status, 200);
+  await page.getByTestId('load-more').click();
+  await until(async () => await savedTotal.textContent() === '53' && (await page.getByTestId('records-status').textContent()).includes('记录已发生变化'), 'expired cursor automatically resets after deletion');
+  assert.equal(await page.getByTestId('record-row').count(), 50);
+  assert.equal((await displayedUrls()).includes(arrivalUrl), false);
+  releaseOldAnalysis(); await delay(500);
+  assert.ok((await page.getByTestId('analysis-status').textContent()).includes('尚未运行实验分析'));
+  assert.equal(await page.locator('.global-loading').count(), 0);
+  await page.unroute(api + '/dashboard/visualization?**');
+  pass('snapshot expiration cancels an older delayed analysis so its result cannot repopulate cleared charts');
+  await page.getByTestId('load-more').click();
+  await until(async () => await page.getByTestId('record-row').count() === 53, 'complete refreshed snapshot after deletion');
+  assert.deepEqual(await displayedUrls(), expectedSnapshotUrls);
+  assert.equal(await page.getByTestId('load-more').count(), 0);
+  pass('external deletion expires the cursor, replaces loaded rows once, and preserves every surviving record without duplicates');
+
+  // Restore also expires cursors even when all restored URLs and totals match.
+  await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
+  await page.getByTestId('records-toggle').click();
+  await until(async () => await page.getByTestId('record-row').count() === 50 && !(await page.getByTestId('load-more').isDisabled()), 'first page before external restore');
+  const externalRestore = await fetch(api + '/data/restore', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', 'X-IDM-Confirm': 'replace-records' }, body: JSON.stringify(paginationBackup) });
+  assert.equal(externalRestore.status, 200);
+  await page.getByTestId('load-more').click();
+  await until(async () => (await page.getByTestId('records-status').textContent()).includes('记录已发生变化') && !(await page.getByTestId('load-more').isDisabled()), 'expired cursor automatically resets after restore');
+  assert.equal(await page.getByTestId('record-row').count(), 50);
+  await page.getByTestId('load-more').click();
+  await until(async () => await page.getByTestId('record-row').count() === 53, 'complete restored snapshot');
+  const restoredUrls = (await (await fetch(api + '/items?page_size=200', { headers })).json()).items.map(item => item.url);
+  assert.deepEqual(await displayedUrls(), restoredUrls);
+  assert.equal(new Set(await displayedUrls()).size, 53);
+  assert.equal(await page.getByTestId('load-more').count(), 0);
+  pass('external restore invalidates the old snapshot even at the same total and reloads replacement IDs without mixing records');
+
+  // Fault injection checks the retry bound only. All insert/delete/restore
+  // scenarios above exercised real backend responses and synthetic SQLite data.
+  await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
+  await page.getByTestId('records-toggle').click();
+  await until(async () => await page.getByTestId('record-row').count() === 50 && !(await page.getByTestId('load-more').isDisabled()), 'first page before repeated conflict fixture');
+  let conflictRequests = 0;
+  await page.route(api + '/items?**', route => {
+    conflictRequests++;
+    return route.fulfill({ status: 409, json: { detail: { code: 'items_snapshot_expired' } } });
+  });
+  await page.getByTestId('load-more').click();
+  await drawer.getByRole('alert').waitFor(); await delay(250);
+  assert.equal(conflictRequests, 2, 'Only one fresh first-page request is permitted after cursor expiration');
+  assert.equal(await page.getByTestId('record-row').count(), 0, 'Expired private records must clear even when recovery fails');
+  assert.equal(await savedTotal.textContent(), '—');
+  assert.equal(await page.getByTestId('load-more').count(), 0);
+  await page.unroute(api + '/items?**');
+  await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
+  await page.getByTestId('records-toggle').click();
+  await until(async () => await savedTotal.textContent() === '53' && !(await page.getByTestId('load-more').isDisabled()), 'manual retry after conflict fixture');
+  await page.getByTestId('load-more').click();
+  await until(async () => await page.getByTestId('record-row').count() === 53, 'manual retry completes snapshot');
+  assert.deepEqual(await displayedUrls(), restoredUrls);
+  pass('repeated conflict fixture stops after one recovery request, clears expired data and supports a later manual retry');
   await page.screenshot({ path: path.join(artifacts, 'records-drawer.png'), fullPage: true });
   await page.getByTestId('drawer-close').click(); await drawer.waitFor({ state: 'hidden' });
   await showSettings();

@@ -38,7 +38,7 @@ export function dailySeries(rows = [], window = {}) {
 }
 
 export function emptyAnalysis(status = 'not_requested') {
-  return { status, window: {}, generatedAt: null, minimumRecords: null, counts: {}, series: {}, warning: false }
+  return { status, window: {}, generatedAt: null, minimumRecords: null, counts: {}, series: {}, coverage: null, warning: false }
 }
 
 export function analysisSnapshot(payload) {
@@ -50,6 +50,17 @@ export function analysisSnapshot(payload) {
     ...emptyAnalysis(payload.analysis_status), window: { ...payload.window },
     generatedAt: payload.generated_at, minimumRecords: payload.minimum_records,
     warning: Boolean(payload.pipeline_warning),
+  }
+  if (Object.hasOwn(payload, 'coverage')) {
+    const coverage = payload.coverage
+    const fields = ['record_count', 'timestamp_count', 'category_count', 'comparison_count', 'sentiment_count']
+    if (!coverage || typeof coverage !== 'object' || Array.isArray(coverage)
+      || fields.some(key => !Number.isSafeInteger(coverage[key]) || coverage[key] < 0)
+      || fields.some(key => coverage[key] > coverage.record_count)
+      || coverage.comparison_count > Math.max(0, coverage.record_count - 1)) {
+      throw new Error('Invalid analysis coverage')
+    }
+    snapshot.coverage = Object.fromEntries(fields.map(key => [key, coverage[key]]))
   }
   // A warning must never become a successful-looking measurement.
   if (snapshot.warning && snapshot.status === 'ready') snapshot.status = 'failed'
@@ -69,15 +80,35 @@ export function analysisSnapshot(payload) {
 }
 
 export function recordsPage(payload) {
-  if (!payload || !Array.isArray(payload.items) || !Number.isInteger(payload.total) || payload.total < 0
-    || !Number.isInteger(payload.page) || payload.page < 1 || !Number.isInteger(payload.page_size) || payload.page_size < 1) {
+  if (!payload || payload.pagination !== 'cursor' || !Array.isArray(payload.items)
+    || !Number.isSafeInteger(payload.total) || payload.total < 0
+    || !Number.isSafeInteger(payload.page) || payload.page < 1
+    || !Number.isSafeInteger(payload.page_size) || payload.page_size < 1 || payload.page_size > 200
+    || typeof payload.has_more !== 'boolean'
+    || !Number.isSafeInteger(payload.snapshot_at) || payload.snapshot_at < 0
+    || !Number.isFinite(new Date(payload.snapshot_at).getTime())
+    || (payload.has_more ? typeof payload.next_cursor !== 'string' || !payload.next_cursor.length : payload.next_cursor !== null)) {
     throw new Error('Invalid records response')
   }
-  return { total: payload.total, page: payload.page, pageSize: payload.page_size, items: payload.items }
+  const offset = (payload.page - 1) * payload.page_size
+  const expectedCount = Math.min(payload.page_size, Math.max(0, payload.total - offset))
+  if (payload.items.length !== expectedCount || payload.has_more !== (offset + payload.items.length < payload.total)
+    || payload.items.some((item, index) => !Number.isSafeInteger(item?.id) || item.id < 1
+      || (index > 0 && item.id >= payload.items[index - 1].id))) {
+    throw new Error('Inconsistent records response')
+  }
+  return { total: payload.total, page: payload.page, pageSize: payload.page_size, items: payload.items,
+    hasMore: payload.has_more, nextCursor: payload.next_cursor, snapshotAt: payload.snapshot_at }
 }
 
-export function appendRecords(current, incoming) {
-  return [...new Map([...current, ...incoming].map(item => [item.id, item])).values()]
+export function mergeRecordsPage(current, incoming) {
+  if (incoming.page !== current.page + 1 || incoming.pageSize !== current.pageSize
+    || incoming.total !== current.total || incoming.snapshotAt !== current.snapshotAt
+    || !current.hasMore || current.items.length !== current.page * current.pageSize
+    || (incoming.items.length && incoming.items[0].id >= current.items.at(-1)?.id)) {
+    throw new Error('Mismatched records snapshot')
+  }
+  return { ...incoming, items: [...current.items, ...incoming.items] }
 }
 
 export function safeHttpUrl(value) {

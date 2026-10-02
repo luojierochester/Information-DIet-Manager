@@ -112,6 +112,8 @@ npm run dev -- --host 127.0.0.1 --strictPort
 
 依赖缺失或分析运行失败时，界面会显示不可用/失败，保留原始记录入口。第二轮已验证合成页面采集到本地数据库的链路；真实模型推理、训练和结论有效性仍未通过验收。
 
+记录抽屉使用固定范围的游标分页：新采集记录在下一次刷新时加入，删除或恢复会使旧分页失效并重读首屏。实验统计分别披露分类、情感和相邻比较的有效数量；第一条没有前驱，不算作相似度 0。完整口径见 [记录与实验统计契约](docs/display-data-contract.md)。
+
 ## 验证
 
 ```powershell
@@ -137,13 +139,15 @@ npm run build
 npm run test:e2e
 ```
 
-测试使用临时数据库和合成密钥。模型输出相关契约测试使用合成结果，与真实推理验收分开记录。扩展与前端验收共用 `chrome-extension` 中锁定的 Playwright 和下载的 Chrome for Testing，不会操作日常 Chrome 配置；它们会在系统临时目录保留合成资料，截图和结果分别写入被 Git 忽略的 `output/playwright/round2/` 和 `output/playwright/round3/`。前端浏览器测试会启动临时后端、构建并服务真实生产页面。
+测试使用临时数据库和合成密钥。模型输出相关契约测试使用合成结果，与真实推理验收分开记录。扩展与前端验收共用 `chrome-extension` 中锁定的 Playwright 和下载的 Chrome for Testing，不会操作日常 Chrome 配置；它们会在系统临时目录保留合成资料，截图和结果分别写入被 Git 忽略的 `output/playwright/round2/` 和 `output/playwright/display-correctness/`。前端浏览器测试会启动临时后端、构建并服务真实生产页面。
 
-Windows CI 会执行上述 Python、扩展与前端单元/浏览器测试及构建。最新结果、限制及后续优先级见 [第三轮改进记录](docs/round-3-improvements.md)；历史基线见 [第二轮](docs/round-2-improvements.md) 和 [第一轮](docs/round-1-improvements.md)。
+Windows CI 会执行上述 Python、扩展与前端单元/浏览器测试及构建，并通过官方服务审计前端、扩展和最小 Python 环境的完整依赖树；查询或解析失败也会阻断。最新结果与后续优先级见 [安全与数据显示改进](docs/security-display-2026-10-03.md)；依赖范围见 [依赖审计记录](docs/dependency-security-2026-10-03.md)。历史基线见 [第三轮](docs/round-3-improvements.md)、[第二轮](docs/round-2-improvements.md) 和 [第一轮](docs/round-1-improvements.md)。
 
 ## 当前发布边界
 
 当前是本地开发预览，尚未达到严格企业级发布标准。已建立基础采集可靠性、API 访问保护、页面记录删除与事务恢复及自动验收。逐站权限、保留周期、重复访问模型、真实算法验收、完整依赖锁定、仓库/许可证和发布治理仍未完成。现有安全机制不防御同一用户权限的恶意进程、已被控制的浏览器或操作系统。旧 `/analyze/run`、`/analyze/run_full`、`/dashboard/summary` 仍保留原有语义，前端已停止使用这些接口作为展示依据。
+
+仪表盘分析在计算期间不持有数据操作总锁或 SQLite 写锁，采集和删除可继续；删除/恢复导致版本变化时丢弃旧结果并返回 409。真实模型入口共享单任务锁，容量超限仍会返回可重试的 503。旧 `run_full` 仍需要完整样本：缺失比较等验证失败返回 422 和失败任务，不再伪装成功或因该输入条件返回 500；其旧综合评分尚未验收。
 
 ## 开发工作流
 

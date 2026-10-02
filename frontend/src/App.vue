@@ -79,7 +79,7 @@
           <span v-if="!connected">{{ t.connectHint }} </span><span role="status" aria-live="polite" data-testid="analysis-status">{{ analysisMessage }}</span>
         </p>
         <p v-if="recordsError" class="interface-hint" role="alert">{{ t.recordsError }}</p>
-        <p v-if="recordsUpdatedAt" class="interface-hint">{{ t.updated }} {{ formatTime(recordsUpdatedAt) }}<span v-if="recordsError"> · {{ t.stale }}</span></p>
+        <p v-if="recordsUpdatedAt" class="interface-hint" data-testid="records-status">{{ t.updated }} {{ formatTime(records.snapshotAt) }} · {{ recordsRefreshed ? t.recordsRefreshed : t.snapshotHint }}<span v-if="recordsError"> · {{ t.stale }}</span></p>
         <p v-if="analysis.generatedAt" class="interface-hint">{{ t.snapshot }} {{ formatTime(analysis.generatedAt) }}</p>
         <p v-if="analysis.window.from_ts != null" class="interface-hint">{{ t.window }} {{ formatUtc(analysis.window.from_ts) }} — {{ formatUtc(analysis.window.to_ts) }} (UTC)</p>
         <p v-if="analysis.window.truncated" role="alert" class="interface-hint">{{ t.truncated.replace('{n}', analysis.window.input_count).replace('{total}', analysis.window.available_count) }}</p>
@@ -112,7 +112,7 @@
           </div>
         </div>
         <div class="drawer-empty" v-else-if="!recordsError"><svg viewBox="0 0 24 24" width="64" height="64" stroke="var(--text-muted)" stroke-width="1" fill="none"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg><p>{{ t.noRecords }}</p><span class="empty-hint">{{ t.rawHint }}</span></div>
-        <div class="pagination" v-if="records.total !== null"><p class="interface-hint">{{ t.loaded.replace('{n}', records.items.length).replace('{total}', records.total) }}</p><button v-if="records.page * records.pageSize < records.total" class="interface-btn" @click="fetchRecords(true)" :disabled="recordsLoading" data-testid="load-more">{{ recordsLoading ? t.loading : t.loadMore }}</button></div>
+        <div class="pagination" v-if="records.total !== null"><p class="interface-hint">{{ t.loaded.replace('{n}', records.items.length).replace('{total}', records.total) }}</p><button v-if="records.hasMore" class="interface-btn" @click="fetchRecords(true)" :disabled="recordsLoading" data-testid="load-more">{{ recordsLoading ? t.loading : t.loadMore }}</button></div>
       </aside>
     </transition>
   </div>
@@ -122,7 +122,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { createCyberCharts } from './cyber-charts.js'
 import { createLocalApi } from './local-api.js'
-import { analysisSnapshot, emptyAnalysis, recordsPage, appendRecords, safeHttpUrl } from './dashboard-data.js'
+import { analysisSnapshot, emptyAnalysis, recordsPage, mergeRecordsPage, safeHttpUrl } from './dashboard-data.js'
 
 // Appearance is the owner's original 4d0bcd9 design; API lifecycle stays isolated.
 const settings = reactive({ lang: 'zh', isLightMode: false, themeColor: '#00f3ff', fontFamily: "'Segoe UI', 'Microsoft YaHei', sans-serif" })
@@ -140,11 +140,13 @@ const copy = {
     subtitle: '本地页面记录与实验性文本统计', dark: '深色', light: '浅色',
     records: '已保存记录 · 全部', refresh: '刷新记录', viewRecords: '查看记录', savedPages: '条已保存页面记录',
     recordLimit: '当前记录按页面去重，不能代表访问次数、阅读时长或完整浏览历史。',
-    loading: '正在读取…', recordsError: '读取记录失败，请检查本地服务后重试。已有显示值来自上次读取。', updated: '读取时间：', stale: '数据可能已过时',
+    loading: '正在读取…', recordsError: '读取记录失败，请检查本地服务后重试。已有显示值来自上次读取。', updated: '记录快照时间：', stale: '数据可能已过时',
+    snapshotHint: '翻页保持同一份记录快照，重新打开抽屉或刷新记录可查看新增记录。', recordsRefreshed: '记录已发生变化，已重新读取第一页；实验图表已清空。',
     analysis: '近 7 天文本统计', experimental: '实验功能', run: '运行实验分析', running: '分析中…',
     analysisLimit: '仅在点击后分析最近 7×24 小时的已保存记录。结果不用于判断信息茧房、心理状态或健康程度。',
     states: { not_requested: '尚未运行实验分析。原始记录可独立查看。', loading: '正在分析，旧图表已清空。', empty: '所选时间范围内没有记录。', insufficient_data: '所选范围样本不足，至少需要 {n} 条记录；未生成分析结论。', unavailable: '实验分析暂不可用，请检查分析依赖和配置。原始记录仍可查看。', failed: '实验分析失败，未生成有效结果。', request_error: '分析请求失败或响应格式不兼容，请检查服务后重试。', ready: '实验统计已生成。图表展示本次快照；新记录不会自动加入，请按需重新运行。' },
-    snapshot: '快照生成时间：', window: '分析范围：', truncated: '范围内共有 {total} 条记录，本次仅读取按时间升序排列的前 {n} 条，不能代表全部记录。', coverage: '本次有效样本 {n} 条；时间范围内已保存记录共 {total} 条。',
+    snapshot: '快照生成时间：', window: '分析范围：', truncated: '范围内共有 {total} 条记录，本次仅读取按时间升序排列的前 {n} 条，不能代表全部记录。', coverage: '本次处理记录 {n} 条；时间范围内已保存记录共 {total} 条。',
+    metricCoverage: '分类有效 {categories}/{n} 条；情感有效 {sentiments}/{n} 条；日期有效 {timestamps}/{n} 条；相邻比较有效 {comparisons}/{pairs} 对。比较按后一条记录的 UTC 日期和分类归属。',
     charts: '实验统计图表', categories: '实验分类分布', categoriesHint: '同一次分析的有效样本数；点击分类可切换趋势。',
     readingGuide: '如何理解这些数据', guide1: '“没有数据”和“比例为零”含义不同，缺失日期保留为空白。', guide2: '相似度只比较相邻文本，不代表全部重复访问或全部重复内容。', guide3: '文本的积极、中性、消极标签不代表用户情绪或心理状态。',
     selectedCategory: '趋势分类', allCategories: '全部分类', repetition: '相邻文本高相似比例', repetitionHint: '实验指标：相邻文本相似度 ≥ 0.85；日期按 UTC。', sentiment: '文本情感标签比例', sentimentHint: '使用实际标签比例；日期按 UTC。',
@@ -164,11 +166,13 @@ const copy = {
     subtitle: 'Local page records and experimental text statistics', dark: 'Dark', light: 'Light',
     records: 'Saved records · All', refresh: 'Refresh records', viewRecords: 'View records', savedPages: 'saved page records',
     recordLimit: 'Records are currently deduplicated by page. They do not measure visits, reading time, or complete browsing history.',
-    loading: 'Loading…', recordsError: 'Could not read records. Check the local service and retry. Existing values are from the previous request.', updated: 'Read at:', stale: 'May be outdated',
+    loading: 'Loading…', recordsError: 'Could not read records. Check the local service and retry. Existing values are from the previous request.', updated: 'Records snapshot:', stale: 'May be outdated',
+    snapshotHint: 'Pages share one snapshot. Reopen the drawer or refresh records to include new arrivals.', recordsRefreshed: 'Records changed. Reloaded the first page and cleared the experimental charts.',
     analysis: 'Text statistics · Last 7 days', experimental: 'Experimental', run: 'Run experimental analysis', running: 'Analyzing…',
     analysisLimit: 'Runs only on request, using saved records from the last 7×24 hours. These results do not assess echo chambers, mental state, or health.',
     states: { not_requested: 'Analysis has not been run. Raw records are available independently.', loading: 'Analyzing. Previous charts have been cleared.', empty: 'No records in this time window.', insufficient_data: 'At least {n} records are required in this window. No analysis was produced.', unavailable: 'Experimental analysis is unavailable. Check its dependencies and configuration. Raw records remain available.', failed: 'Experimental analysis failed. No valid result was produced.', request_error: 'Analysis request failed or the response is incompatible. Check the service and retry.', ready: 'This is an experimental snapshot. Run analysis again to include new records.' },
-    snapshot: 'Snapshot generated:', window: 'Window:', truncated: 'The window contains {total} records. Only the first {n} in ascending timestamp order were read; this does not represent all records.', coverage: '{n} valid samples analyzed; {total} saved records in the window.',
+    snapshot: 'Snapshot generated:', window: 'Window:', truncated: 'The window contains {total} records. Only the first {n} in ascending timestamp order were read; this does not represent all records.', coverage: '{n} records processed; {total} saved records in the window.',
+    metricCoverage: 'Valid categories: {categories}/{n} records; sentiment: {sentiments}/{n}; dates: {timestamps}/{n}; adjacent comparisons: {comparisons}/{pairs} pairs. Each comparison belongs to the later record’s UTC date and category.',
     charts: 'Experimental charts', categories: 'Experimental categories', categoriesHint: 'Valid sample counts from this analysis. Click a category to filter trends.',
     readingGuide: 'Reading these statistics', guide1: 'Missing values are different from zero. Dates without data remain blank.', guide2: 'Similarity compares adjacent texts only; it does not measure all repeated visits or content.', guide3: 'Positive, neutral and negative text labels do not describe your mood or mental state.',
     selectedCategory: 'Trend category', allCategories: 'All categories', repetition: 'High adjacent-text similarity', repetitionHint: 'Experimental: adjacent-text similarity ≥ 0.85. Dates use UTC.', sentiment: 'Text sentiment proportions', sentimentHint: 'Actual label proportions. Dates use UTC.',
@@ -199,15 +203,24 @@ try { api = createLocalApi(import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.
 const connected = ref(false), pairing = ref(false), keyDraft = ref(''), connectionMessage = ref('')
 const maintenance = ref(false), maintenanceMessage = ref(''), restoreFile = ref(null)
 let dataGeneration = 0
-const records = reactive({ items: [], total: null, page: 0, pageSize: 50 })
-const recordsLoading = ref(false), recordsError = ref(false), recordsUpdatedAt = ref(null)
+const emptyRecords = () => ({ items: [], total: null, page: 0, pageSize: 50, hasMore: false, nextCursor: null, snapshotAt: null })
+const records = reactive(emptyRecords())
+const recordsLoading = ref(false), recordsError = ref(false), recordsUpdatedAt = ref(null), recordsRefreshed = ref(false)
 const analysis = ref(emptyAnalysis()), category = ref('global'), drawerOpen = ref(false)
 const recordsDialog = ref(null), recordsButton = ref(null), settingsButton = ref(null)
 const deleteRecordId = ref('')
 const pieRef = ref(null), graphRef = ref(null), repeatRef = ref(null), sentimentRef = ref(null)
 let recordController, analysisController, timer, charts
 let disposed = false
-const analysisMessage = computed(() => (t.value.states[analysis.value.status] || t.value.states.request_error).replace('{n}', analysis.value.minimumRecords ?? '—'))
+const analysisMessage = computed(() => {
+  const state = analysis.value
+  const message = (t.value.states[state.status] || t.value.states.request_error).replace('{n}', state.minimumRecords ?? '—')
+  if (state.status !== 'ready' || !state.coverage) return message
+  const coverage = state.coverage
+  const values = { n: coverage.record_count, categories: coverage.category_count, sentiments: coverage.sentiment_count,
+    timestamps: coverage.timestamp_count, comparisons: coverage.comparison_count, pairs: Math.max(0, coverage.record_count - 1) }
+  return message + ' ' + t.value.metricCoverage.replace(/\{(\w+)\}/g, (_, key) => values[key])
+})
 const categoryLabel = key => key === 'global' ? t.value.allCategories : (t.value.cats[key] || key)
 const sourceLabel = source => source === 'plugin' ? t.value.plugin : source === 'import' ? t.value.imported : (source || t.value.unknown)
 const formatTime = value => typeof value === 'number' && Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString(lang.value === 'zh' ? 'zh-CN' : 'en-GB') : t.value.unknown
@@ -215,8 +228,8 @@ const formatUtc = value => typeof value === 'number' && Number.isFinite(new Date
 
 function resetData() {
   dataGeneration++; recordController?.abort(); analysisController?.abort()
-  Object.assign(records, { items: [], total: null, page: 0, pageSize: 50 })
-  recordsLoading.value = false; recordsError.value = false; recordsUpdatedAt.value = null
+  Object.assign(records, emptyRecords())
+  recordsLoading.value = false; recordsError.value = false; recordsUpdatedAt.value = null; recordsRefreshed.value = false
   analysis.value = emptyAnalysis(); category.value = 'global'; deleteRecordId.value = ''
 }
 function disconnect() {
@@ -271,17 +284,33 @@ async function deleteRecord(id) {
 }
 
 async function fetchRecords(append = false, background = false) {
-  if (!connected.value || maintenance.value || recordsLoading.value) return
+  if (!connected.value || maintenance.value || recordsLoading.value || (append && !records.hasMore)) return
   recordsLoading.value = true
-  const controller = new AbortController(), epoch = dataGeneration
+  const controller = new AbortController()
+  let epoch = dataGeneration
   recordController = controller
   try {
-    const response = await api.get('/items', { params: { page: append ? records.page + 1 : 1, page_size: 50 }, signal: controller.signal })
+    let response, refreshed = false
+    try {
+      response = await api.get('/items', { params: { pagination: 'cursor', page_size: 50,
+        ...(append ? { cursor: records.nextCursor } : {}) }, signal: controller.signal })
+    } catch (error) {
+      if (!append || error.code !== 'items_snapshot_expired' || epoch !== dataGeneration) throw error
+      // The old set can contain deleted or replaced records. Clear it before
+      // the single recovery request; never merge across snapshots or retry in a loop.
+      dataGeneration++; epoch = dataGeneration; analysisController?.abort()
+      Object.assign(records, emptyRecords()); recordsUpdatedAt.value = null
+      deleteRecordId.value = ''; analysis.value = emptyAnalysis(); category.value = 'global'
+      recordsRefreshed.value = false; refreshed = true; append = false
+      response = await api.get('/items', { params: { pagination: 'cursor', page_size: 50 }, signal: controller.signal })
+    }
     // An already-started poll must not replace loaded pages while the user
     // is choosing a record in settings or reading the drawer.
     if (epoch !== dataGeneration || (background && (showSettings.value || drawerOpen.value))) return
     const page = recordsPage(response.data)
-    Object.assign(records, { ...page, items: append ? appendRecords(records.items, page.items) : page.items })
+    if (!append && page.page !== 1) throw new Error('Invalid first records page')
+    Object.assign(records, append ? mergeRecordsPage(records, page) : page)
+    if (!append) recordsRefreshed.value = refreshed
     if (!records.items.some(item => String(item.id) === deleteRecordId.value)) deleteRecordId.value = ''
     recordsUpdatedAt.value = Date.now()
     recordsError.value = false
