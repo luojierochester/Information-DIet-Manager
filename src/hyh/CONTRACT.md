@@ -209,7 +209,7 @@ Historical job/result/history reads return `409` with `detail.code: "stored_anal
   - validates format/version/schema/checksum before deleting anything; one transaction then replaces every page record, regenerates embeddings and clears derived analysis
   - regenerates internal IDs/creation timestamps. The normalized page fields round-trip; this is a logical backup, not a byte-for-byte SQLite restore or migration of all historical database formats
   - duplicate normalized URLs are an error; any failure rolls back deletion and all partial inserts. Returns `{"restored":n,"analysis_cleared":true}` on commit
-  - request-task cancellation waits for the replacement worker to commit or roll back and close its connection before releasing data-operation/request capacity. Cancellation does not promise to undo an already authorized restore. This request ownership does not yet protect against a server shutdown path that closes lifespan without draining requests
+  - request-task cancellation waits for the replacement worker to commit or roll back and close its connection before releasing data-operation/request capacity. Cancellation does not promise to undo an already authorized restore
   - bad schema/checksum/duplicates return `422`; storage failures return `500`; missing/wrong confirmation returns `400`
 - Transactional revision and original-job-state checks prevent either analysis route from republishing results after successful delete/restore. External updates also invalidate results through schema triggers; directly removing triggers or replacing live database files is unsupported.
 - Pause the extension and clear its pending queue before deletion/restoration. Already received requests, later uploads or subsequent browsing can recreate records. Downloaded backups and extension storage are outside these API transactions. No forensic erasure guarantee is made.
@@ -244,6 +244,8 @@ Historical job/result/history reads return `409` with `detail.code: "stored_anal
 - cache events are recorded in `analysis_jobs` (`cache_hit = 1`)
 
 ## 6. Error Contract
+- Collection, import, deletion, restore, lightweight statistics/summary, model analysis and export/backup preparation retain worker ownership through repeated request cancellation. Upload files remain open until import workers stop reading. Their existing success/error and transaction contracts remain unchanged; cancellation is not an undo operation.
+- Each application lifespan tracks these executor Futures and stops admitting new work before shutdown. Already accepted requests that have not started work return fixed `503` with `Retry-After: 5` after closing begins. Lifespan retains the OS database lock until registered workers finish, including Uvicorn's graceful-timeout cancellation path. This does not impose a hard model deadline, cover unregistered read handlers, or guarantee behavior under process crashes/OS force-kill; permanently blocked workers can keep graceful shutdown waiting.
 - invalid `/collect` request fields -> `422`; malformed/unsupported import files -> `400`
 - job not found -> `404`
 - result requested before completion -> `409`

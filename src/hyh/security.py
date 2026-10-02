@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
+from .owned_work import WorkOwnerClosed
+
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 EXTENSION_ORIGIN = r"chrome-extension://[a-p]{32}"
 DEFAULT_ORIGINS = "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173,http://localhost:4173"
@@ -166,6 +168,9 @@ class LocalAccessMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         security = scope["app"].state.security
+        # Capture this lifespan before any await; an old request must never
+        # attach its worker to a later lifespan's owner after body/lock waits.
+        work_owner = scope["app"].state.work_owner
         headers = {}
         for key, value in scope["headers"]:
             key = key.lower()
@@ -197,6 +202,9 @@ class LocalAccessMiddleware:
             if role == "collector" and (scope["path"], scope["method"]) not in {("/collect", "POST"), ("/session", "GET")}:
                 return await JSONResponse({"detail": "Admin access required"}, status_code=403)(scope, receive, protected_send)
             scope["idm_role"] = role
+            if work_owner.closing:
+                return await JSONResponse({"detail": "Service is shutting down; retry later"}, status_code=503,
+                                          headers={"Retry-After": "5"})(scope, receive, protected_send)
             slots = scope["app"].state.request_slots
             try:
                 await asyncio.wait_for(slots.acquire(), timeout=0.1)
@@ -284,7 +292,15 @@ class LocalAccessMiddleware:
                     return await JSONResponse({"detail": "Service busy; retry later"}, status_code=503,
                                               headers={"Retry-After": "5"})(scope, receive, protected_send)
                 try:
-                    await self.app(scope, buffered_receive, operation_send)
+                    if work_owner.closing:
+                        raise WorkOwnerClosed()
+                    with work_owner.bind():
+                        await self.app(scope, buffered_receive, operation_send)
+                except WorkOwnerClosed:
+                    if response_started:
+                        raise
+                    await JSONResponse({"detail": "Service is shutting down; retry later"}, status_code=503,
+                                       headers={"Retry-After": "5"})(scope, buffered_receive, protected_send)
                 except Exception as error:
                     if response_started:
                         raise

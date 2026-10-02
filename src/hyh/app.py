@@ -28,7 +28,7 @@ from .data_management import install_data_routes
 from .item_pagination import read_cursor_page
 from .visualization_metrics import finite_metric
 from . import export_io
-from .owned_work import run_owned_sync
+from .owned_work import WorkOwner, run_owned_sync
 from .analysis_json import InvalidStoredAnalysis, load_analysis_json, validate_analysis_value
 
 from contextlib import asynccontextmanager, nullcontext
@@ -968,8 +968,15 @@ async def lifespan(_app: FastAPI):
         _app.state.analysis_lock = asyncio.Lock()
         _app.state.request_slots = asyncio.Semaphore(4)
         _app.state.export_slots = asyncio.Semaphore(2)
+        work_owner = WorkOwner()
+        _app.state.work_owner = work_owner
         init_db(_schema_path())
-        yield
+        try:
+            yield
+        finally:
+            # Uvicorn may end lifespan immediately after cancelling requests.
+            # Retain the OS database lock until their actual workers finish.
+            await work_owner.drain()
 
 
 app = FastAPI(
@@ -1000,14 +1007,23 @@ def session(request: Request):
     return {"role": request.scope["idm_role"]}
 
 
-@app.post("/collect", response_model=IngestAck)
-def collect(item: IngestItem) -> IngestAck:
+def _collect_sync(item: IngestItem) -> IngestAck:
     inserted, duplicates = insert_items([item])
     return IngestAck(inserted=inserted, duplicates=duplicates, failed=0)
 
 
+@app.post("/collect", response_model=IngestAck)
+async def collect(item: IngestItem) -> IngestAck:
+    return await run_owned_sync(_collect_sync, item=item)
+
+
 @app.post("/import", response_model=IngestAck)
-def import_items(file: UploadFile = File(...)) -> IngestAck:
+async def import_items(file: UploadFile = File(...)) -> IngestAck:
+    # Keep FastAPI's request-owned upload open until its worker stops reading.
+    return await run_owned_sync(_import_items_sync, file=file)
+
+
+def _import_items_sync(file: UploadFile) -> IngestAck:
     filename = (file.filename or "").lower()
     text = _read_upload(file)
     failed = 0
@@ -1181,11 +1197,11 @@ def _global_statistics(*, force: bool, backfill_limit: int, record_run: bool) ->
 
 
 @app.post("/analyze/run")
-def run_analysis(
+async def run_analysis(
     force: bool = Query(False),
     backfill_limit: int = Query(2000, ge=0, le=20000),
 ) -> Dict[str, Any]:
-    return _global_statistics(force=force, backfill_limit=backfill_limit, record_run=True)
+    return await run_owned_sync(_global_statistics, force=force, backfill_limit=backfill_limit, record_run=True)
 
 
 @app.get("/analyze/history")
@@ -1470,8 +1486,8 @@ def get_analyze_result(job_id: int) -> Dict[str, Any]:
 
 
 @app.get("/dashboard/summary")
-def dashboard_summary() -> Dict[str, Any]:
-    return _global_statistics(force=False, backfill_limit=2000, record_run=False)
+async def dashboard_summary() -> Dict[str, Any]:
+    return await run_owned_sync(_global_statistics, force=False, backfill_limit=2000, record_run=False)
 
 
 # 以下路由用于“后端->逻辑”的接口

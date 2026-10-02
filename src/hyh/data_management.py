@@ -164,31 +164,39 @@ def _prepare_backup_response():
         raise
 
 
+def _delete_item_sync(item_id: int):
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not 1 <= item_id <= 2**63 - 1 or not conn.execute("SELECT id FROM items WHERE id = ?", (item_id,)).fetchone():
+            raise HTTPException(404, "Record not found")
+        conn.execute("DELETE FROM embeddings WHERE item_id = ?", (item_id,))
+        conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+        clear_derived(conn)
+    return {"deleted": 1, "analysis_cleared": True}
+
+
+def _delete_all_sync():
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        clear_all(conn)
+    return {"deleted": count, "analysis_cleared": True}
+
+
 def install_data_routes(app, insert_items):
     @app.get("/data/backup")
     async def backup():
         return await run_owned_sync(_prepare_backup_response, on_cancel=lambda response: response.close())
 
     @app.delete("/items/{item_id}")
-    def delete_item(item_id: int, request: Request):
+    async def delete_item(item_id: int, request: Request):
         require_confirmation(request, "delete-record")
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if not 1 <= item_id <= 2**63 - 1 or not conn.execute("SELECT id FROM items WHERE id = ?", (item_id,)).fetchone():
-                raise HTTPException(404, "Record not found")
-            conn.execute("DELETE FROM embeddings WHERE item_id = ?", (item_id,))
-            conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
-            clear_derived(conn)
-        return {"deleted": 1, "analysis_cleared": True}
+        return await run_owned_sync(_delete_item_sync, item_id=item_id)
 
     @app.delete("/data")
-    def delete_all(request: Request):
+    async def delete_all(request: Request):
         require_confirmation(request, "delete-all")
-        with get_conn() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-            clear_all(conn)
-        return {"deleted": count, "analysis_cleared": True}
+        return await run_owned_sync(_delete_all_sync)
 
     @app.post("/data/restore")
     async def restore(request: Request):
