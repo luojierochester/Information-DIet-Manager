@@ -29,6 +29,7 @@ from .item_pagination import read_cursor_page
 from .visualization_metrics import finite_metric
 from . import export_io
 from .owned_work import run_owned_sync
+from .analysis_json import InvalidStoredAnalysis, load_analysis_json, validate_analysis_value
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -673,12 +674,9 @@ def _get_job_row(conn: Any, job_id: int) -> Optional[Dict[str, Any]]:
     if row is None:
         return None
     data = dict(row)
+    _validate_stored_analysis(data)
     for key in ("result_payload", "metrics_json"):
-        if data.get(key):
-            try:
-                data[key] = json.loads(data[key])
-            except json.JSONDecodeError:
-                data[key] = None
+        data[key] = _read_stored_analysis(data.get(key))
     data["cache_hit"] = bool(data.get("cache_hit", 0))
     return data
 
@@ -759,16 +757,32 @@ def _load_items_from_jsonl(text: str) -> List[Dict[str, Any]]:
 
 
 # 以下函数用于辅助“后端->逻辑”的接口实现
-def _load_analysis_cache(value: Any) -> Dict[str, Any]:
-    """Reject legacy non-JSON numbers rather than reusing them as missing values."""
+def _stored_analysis_conflict() -> HTTPException:
+    return HTTPException(status_code=409, detail={
+        "code": "stored_analysis_invalid", "message": "Stored analysis data is invalid.",
+    })
+
+
+def _validate_stored_analysis(value: Any) -> None:
     try:
-        payload = json.loads(value)
-        if not isinstance(payload, dict):
-            return {}
-        # json.loads accepts NaN/Infinity and overflows 1e999 to infinity.
-        json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        return payload
-    except (TypeError, ValueError, RecursionError):
+        validate_analysis_value(value)
+    except InvalidStoredAnalysis:
+        raise _stored_analysis_conflict() from None
+
+
+def _read_stored_analysis(value: Any) -> Any:
+    try:
+        return load_analysis_json(value)
+    except InvalidStoredAnalysis:
+        raise _stored_analysis_conflict() from None
+
+
+def _load_analysis_cache(value: Any) -> Dict[str, Any]:
+    """Invalid stored caches are recomputed; their historical rows stay intact."""
+    try:
+        payload = load_analysis_json(value)
+        return payload if isinstance(payload, dict) else {}
+    except InvalidStoredAnalysis:
         return {}
 
 
@@ -1085,10 +1099,7 @@ def _global_statistics(*, force: bool, backfill_limit: int, record_run: bool) ->
         ).fetchone()
         payload = None
         if not force and existing is not None:
-            try:
-                candidate = json.loads(existing["payload"])
-            except (TypeError, json.JSONDecodeError):
-                candidate = None
+            candidate = _load_analysis_cache(existing["payload"])
             if (isinstance(candidate, dict)
                     and candidate.get("statistics_scope") == "all_saved_pages"
                     and candidate.get("statistics_version") == 1
@@ -1191,11 +1202,8 @@ def analyze_history(limit: int = Query(20, ge=1, le=200)) -> Dict[str, Any]:
     runs: List[Dict[str, Any]] = []
     for row in rows:
         run = dict(row)
-        if run.get("channel_counts"):
-            try:
-                run["channel_counts"] = json.loads(run["channel_counts"])
-            except json.JSONDecodeError:
-                run["channel_counts"] = None
+        _validate_stored_analysis(run)
+        run["channel_counts"] = _read_stored_analysis(run.get("channel_counts"))
         run["cached"] = bool(run.get("cached", 0))
         runs.append(run)
     return {"total": len(runs), "runs": runs}
@@ -1376,6 +1384,9 @@ def _run_full_analysis_snapshot(*, force, from_ts, to_ts, limit_rows):
             return _failed_full_response(conn, job_id, started_at, input_count, *failure)
         conn.execute("SAVEPOINT legacy_analysis_result")
         try:
+            # Newly published reports must satisfy the same finite, UTF-8 and
+            # depth contract as historical reads. Fail inside the savepoint.
+            validate_analysis_value(payload)
             conn.execute(
                 """
                 INSERT INTO analysis_runs (

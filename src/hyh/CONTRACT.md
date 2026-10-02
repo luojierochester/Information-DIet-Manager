@@ -171,8 +171,8 @@ Backend normalization:
   - top-level `repeat_metric: "legacy_adjacent_text_similarity_threshold_fraction"` uses valid original adjacent comparisons; the embedded quick/full scoring reports remain experimental legacy outputs with their own preprocessing, not independently validated measurements
   - unavailable dependencies/pipeline return 503, incomplete samples return 422, and unexpected failures return 500; each has a safe fixed message, failed status and `job_id`, without fabricated neutral measurements or raw exception details
   - a savepoint rolls back partially written successful results while retaining the failed job; a database failure that also prevents saving the job cannot guarantee a durable failure record
-  - reports containing NaN/infinite JSON numbers are rejected during persistence with a safe failed `500`; they are not saved as completed or silently reinterpreted as null
-  - both analysis routes treat legacy caches containing non-finite numbers (including exponent overflow) as a cache miss and recompute, without deleting historical jobs
+  - reports containing NaN/infinite JSON numbers, invalid UTF-8 text or more than 64 nested JSON containers are rejected during persistence with a safe failed `500`; they are not saved as completed or silently reinterpreted as null
+  - all global/full/dashboard analysis cache reads reject non-finite numbers (including exponent overflow), invalid JSON/Unicode and more than 64 nested containers. Invalid caches are recomputed without deleting historical rows; global statistics recalculate from items and refresh their daily projection
   - a running job is committed before inference, which holds no SQLite connection or data-operation lock. New collection does not change that job's input snapshot; subsequent requests use a new cache key. Deletion/restoration/direct updates invalidate publication with `409 analysis_snapshot_expired`; a removed or non-running original job also invalidates publication, including an empty-library clear with unchanged record revision
   - caller cancellation does not stop model execution: the model gate remains held until the worker exits, and its result may still be saved if the data snapshot is valid. Hard model termination/time limits remain unimplemented
   - empty input does not load optional models; ready means the legacy computation completed, not that its model/scoring accuracy has been accepted
@@ -184,6 +184,8 @@ Backend normalization:
 - `GET /analyze/result/{job_id}`
   - completed job result payload
   - the same missing-ID rule applies; an existing incomplete job still returns `409`
+
+Historical job/result/history reads return `409` with `detail.code: "stored_analysis_invalid"` for malformed JSON, non-finite numbers, invalid UTF-8 text or more than 64 nested containers. The root object/array counts as level 1. These reads do not rewrite history or silently convert corruption to null; legitimate SQL NULL/JSON null remain missing measurements. A history list fails as a whole if a returned row is invalid. These checks do not constitute complete report business-schema validation.
 
 ### 3.4 Page-record lifecycle (admin only)
 - `GET /data/backup`
