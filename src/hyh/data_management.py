@@ -203,8 +203,6 @@ def install_data_routes(app, insert_items):
                 raise ValueError()
         except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
             raise HTTPException(422, "Invalid, unsupported or damaged page-record backup") from None
-        from starlette.concurrency import run_in_threadpool
-
         def replace():
             with get_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -214,4 +212,4 @@ def install_data_routes(app, insert_items):
                     raise HTTPException(422, "Backup contains duplicate normalized page URLs; nothing changed")
             return {"restored": inserted, "analysis_cleared": True}
 
-        return await run_in_threadpool(replace)
+        return await run_owned_sync(replace)
