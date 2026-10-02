@@ -267,11 +267,40 @@ async function run() {
       body: JSON.stringify({ url: 'https://example.invalid/' + i, title: 'Synthetic page ' + i, text: 'Synthetic pagination content', ts: Date.now(), source: 'plugin' }) });
     assert.equal(response.status, 200); assert.equal((await response.json()).inserted, 1);
   }
+  const seededPageResponse = page.waitForResponse(response => {
+    const url = new URL(response.url());
+    return response.request().method() === 'GET' && url.origin === api && url.pathname === '/items' && !url.searchParams.has('cursor');
+  });
   await page.getByTestId('refresh-records').click();
+  const seededPage = await (await seededPageResponse).json();
   await until(async () => await savedTotal.textContent() === '53', 'pagination seed count');
-  await hideSettings();
+  // Keep settings open until openRecords closes them, so background polling
+  // cannot consume the one-shot gate intended for the drawer's fresh page.
+  const previousSnapshotStatus = await page.getByTestId('records-status').textContent();
+  // Reopening requests a new first page while the previous 50 rows remain
+  // visible. Hold that real request so stale row counts cannot satisfy the
+  // readiness check; do not manufacture an API response or relax timestamps.
+  let releaseDrawerRefresh;
+  const firstPageUrl = url => url.origin === api && url.pathname === '/items' && !url.searchParams.has('cursor');
+  await page.route(firstPageUrl, async route => {
+    await new Promise(resolve => { releaseDrawerRefresh = resolve; });
+    await route.fulfill({ response: await route.fetch() });
+  }, { times: 1 });
+  const drawerPageResponse = page.waitForResponse(response => response.request().method() === 'GET' && firstPageUrl(new URL(response.url())));
   await page.getByTestId('records-toggle').click();
-  await until(async () => await page.getByTestId('record-row').count() === 50, 'first drawer page');
+  await until(() => Boolean(releaseDrawerRefresh), 'held real drawer refresh');
+  assert.equal(await page.getByTestId('record-row').count(), 50, 'Old rows remain visible while the fresh first page is pending');
+  assert.equal(await page.getByTestId('load-more').isDisabled(), true, 'Pagination cannot use the previous cursor while refreshing');
+  assert.equal(await page.getByTestId('records-status').textContent(), previousSnapshotStatus);
+  // Make the two real snapshots observably different even on a fast runner.
+  await until(() => Date.now() >= (Math.floor(seededPage.snapshot_at / 1000) + 1) * 1000, 'next snapshot display second');
+  releaseDrawerRefresh();
+  const drawerPage = await (await drawerPageResponse).json();
+  assert.ok(Math.floor(drawerPage.snapshot_at / 1000) > Math.floor(seededPage.snapshot_at / 1000));
+  await until(async () => await page.getByTestId('record-row').count() === 50 &&
+    !(await page.getByTestId('load-more').isDisabled()) &&
+    await page.getByTestId('records-status').textContent() !== previousSnapshotStatus, 'fresh first drawer page rendered');
+  pass('drawer refresh keeps previous rows visible but blocks pagination until the real new snapshot is rendered');
   const expectedSnapshotUrls = (await (await fetch(api + '/items?page_size=200', { headers })).json()).items.map(item => item.url);
   const paginationBackup = await (await fetch(api + '/data/backup', { headers })).json();
   const snapshotStatus = await page.getByTestId('records-status').textContent();
