@@ -175,9 +175,11 @@ Backend normalization:
 
 - `GET /analyze/jobs/{job_id}`
   - job status + metadata
+  - nonexistent integer IDs, including values outside SQLite's signed 64-bit range, return `404` without database binding overflow
 
 - `GET /analyze/result/{job_id}`
   - completed job result payload
+  - the same missing-ID rule applies; an existing incomplete job still returns `409`
 
 ### 3.4 Page-record lifecycle (admin only)
 - `GET /data/backup`

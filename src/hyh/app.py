@@ -660,6 +660,10 @@ def _run_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _get_job_row(conn: Any, job_id: int) -> Optional[Dict[str, Any]]:
+    # Python integers are unbounded, but SQLite INTEGER primary keys are not.
+    # An unrepresentable identifier cannot name a stored job.
+    if not -(2**63) <= job_id <= 2**63 - 1:
+        return None
     row = conn.execute(
         "SELECT * FROM analysis_jobs WHERE id = ? LIMIT 1",
         (job_id,),
