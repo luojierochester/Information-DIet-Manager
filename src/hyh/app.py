@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 
 from .db import get_conn, init_db
 from .models import IngestAck, IngestItem, MAX_INGEST_TS
@@ -27,6 +27,7 @@ from .security import LocalAccessMiddleware, LocalSecurity, process_ownership
 from .data_management import install_data_routes
 from .item_pagination import read_cursor_page
 from .visualization_metrics import finite_metric
+from . import export_io
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -770,36 +771,7 @@ def _safe_json_loads(value: Any) -> Any:
     return None
 
 
-def _load_items_for_export(
-    conn: Any,
-    from_ts: Optional[int],
-    to_ts: Optional[int],
-    limit_rows: int,
-) -> List[Dict[str, Any]]:
-    where_parts = ["1=1"]
-    params: List[Any] = []
-    if from_ts is not None:
-        where_parts.append("ts >= ?")
-        params.append(from_ts)
-    if to_ts is not None:
-        where_parts.append("ts <= ?")
-        params.append(to_ts)
-
-    where_sql = " AND ".join(where_parts)
-    sql = f"""
-        SELECT id, url, title, text, ts, source, lang, channel, author, tags, meta, created_at
-        FROM items
-        WHERE {where_sql}
-        ORDER BY ts ASC, id ASC
-        LIMIT ?
-    """
-    params.append(limit_rows)
-    rows = conn.execute(sql, tuple(params)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def _shape_export_rows(rows: List[Dict[str, Any]], view: str) -> List[Dict[str, Any]]:
-    shaped: List[Dict[str, Any]] = []
+def _shape_export_rows(rows: Iterable[Dict[str, Any]], view: str) -> Iterable[Dict[str, Any]]:
     for r in rows:
         title = _clean_optional_str(r.get("title")) or ""
         text = _clean_optional_str(r.get("text")) or title
@@ -808,8 +780,7 @@ def _shape_export_rows(rows: List[Dict[str, Any]], view: str) -> List[Dict[str, 
         meta = _safe_json_loads(r.get("meta"))
 
         if view == "analysis":
-            shaped.append(
-                {
+            yield {
                     "id": r.get("id"),
                     "title": title,
                     "url": r.get("url"),
@@ -823,10 +794,8 @@ def _shape_export_rows(rows: List[Dict[str, Any]], view: str) -> List[Dict[str, 
                     "tags": tags,
                     "meta": meta,
                 }
-            )
         else:  # raw
-            shaped.append(
-                {
+            yield {
                     "id": r.get("id"),
                     "url": r.get("url"),
                     "title": title,
@@ -840,12 +809,6 @@ def _shape_export_rows(rows: List[Dict[str, Any]], view: str) -> List[Dict[str, 
                     "meta": meta,
                     "created_at": r.get("created_at"),
                 }
-            )
-    return shaped
-
-
-def _to_jsonl(items: List[Dict[str, Any]]) -> str:
-    return "\n".join(json.dumps(x, ensure_ascii=False) for x in items)
 
 
 EXPORT_CSV_COLUMNS = {
@@ -855,22 +818,6 @@ EXPORT_CSV_COLUMNS = {
             "author", "tags", "meta", "created_at"),
 }
 TRAINING_CSV_COLUMNS = ("input", "label", "ts", "url", "title", "source")
-
-
-def _to_csv(items: List[Dict[str, Any]], fieldnames: Iterable[str]) -> str:
-    # The schema belongs to the export contract, including a zero-row result.
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=fieldnames)
-    writer.writeheader()
-    for row in items:
-        safe_row = {}
-        for k, v in row.items():
-            if isinstance(v, (dict, list)):
-                safe_row[k] = json.dumps(v, ensure_ascii=False)
-            else:
-                safe_row[k] = v
-        writer.writerow(safe_row)
-    return buf.getvalue()
 
 
 def _host_is_private(host: str) -> bool:
@@ -940,18 +887,16 @@ def _compress_ws(text: str) -> str:
 
 
 def _prepare_training_rows(
-    rows: List[Dict[str, Any]],
+    rows: Iterable[Dict[str, Any]],
     *,
+    budget: export_io.PreparationBudget,
     label_field: str,
     exclude_internal: bool,
     exclude_auth_pages: bool,
     exclude_search_pages: bool,
     dedup_by_input: bool,
     max_input_len: int,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-
+) -> Iterable[Dict[str, Any]]:
     for r in rows:
         url = str(r.get("url") or "")
         title = _clean_optional_str(r.get("title")) or ""
@@ -974,12 +919,10 @@ def _prepare_training_rows(
 
         if dedup_by_input:
             key = normalize_text("", input_text)
-            if key in seen:
+            if budget.duplicate(key):
                 continue
-            seen.add(key)
 
-        out.append(
-            {
+        yield {
                 "input": input_text,
                 "label": label,
                 "ts": r.get("ts"),
@@ -987,8 +930,6 @@ def _prepare_training_rows(
                 "title": title,
                 "source": r.get("source"),
             }
-        )
-    return out
 
 
 @asynccontextmanager
@@ -998,6 +939,7 @@ async def lifespan(_app: FastAPI):
         _app.state.operation_lock = asyncio.Lock()
         _app.state.analysis_lock = asyncio.Lock()
         _app.state.request_slots = asyncio.Semaphore(4)
+        _app.state.export_slots = asyncio.Semaphore(2)
         init_db(_schema_path())
         yield
 
@@ -1684,7 +1626,7 @@ def dashboard_visualization(
 
 
 @app.get("/export/lsj")
-def export_lsj(
+async def export_lsj(
     from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=200000),
@@ -1702,45 +1644,17 @@ def export_lsj(
             status_code=400, detail="from_ts cannot be greater than to_ts"
         )
 
-    with get_conn() as conn:
-        rows = _load_items_for_export(
-            conn, from_ts=from_ts, to_ts=to_ts, limit_rows=limit_rows
-        )
-
-    items = _shape_export_rows(rows, view=view)
-
-    if fmt == "json":
-        return {
-            "count": len(items),
-            "view": view,
-            "from_ts": from_ts,
-            "to_ts": to_ts,
-            "items": items,
-        }
-
-    if fmt == "jsonl":
-        content = _to_jsonl(items)
-        return StreamingResponse(
-            io.StringIO(content),
-            media_type="application/x-ndjson",
-            headers={
-                "Content-Disposition": f'attachment; filename="lsj_export_{view}.jsonl"'
-            },
-        )
-
-    # csv
-    content = _to_csv(items, EXPORT_CSV_COLUMNS[view])
-    return StreamingResponse(
-        io.StringIO(content),
-        media_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="lsj_export_{view}.csv"'
-        },
+    return await export_io.prepare_export_response(
+        transform=lambda rows, budget: _shape_export_rows(rows, view),
+        from_ts=from_ts, to_ts=to_ts, limit_rows=limit_rows, fmt=fmt,
+        columns=EXPORT_CSV_COLUMNS[view],
+        metadata={"view": view, "from_ts": from_ts, "to_ts": to_ts},
+        filename=f"lsj_export_{view}",
     )
 
 
 @app.get("/export/lsj/training")
-def export_lsj_training(
+async def export_lsj_training(
     from_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     to_ts: Optional[int] = Query(None, ge=0, le=MAX_INGEST_TS),
     limit_rows: int = Query(5000, ge=1, le=200000),
@@ -1765,47 +1679,16 @@ def export_lsj_training(
             status_code=400, detail="from_ts cannot be greater than to_ts"
         )
 
-    with get_conn() as conn:
-        rows = _load_items_for_export(
-            conn, from_ts=from_ts, to_ts=to_ts, limit_rows=limit_rows
-        )
-
-    items = _prepare_training_rows(
-        rows,
-        label_field=label_field,
-        exclude_internal=exclude_internal,
-        exclude_auth_pages=exclude_auth_pages,
-        exclude_search_pages=exclude_search_pages,
-        dedup_by_input=dedup_by_input,
-        max_input_len=max_input_len,
-    )
-
-    if fmt == "json":
-        if bare:
-            return items
-        return {
-            "count": len(items),
-            "label_field": label_field,
-            "from_ts": from_ts,
-            "to_ts": to_ts,
-            "items": items,
-        }
-
-    if fmt == "jsonl":
-        content = _to_jsonl(items)
-        return StreamingResponse(
-            io.StringIO(content),
-            media_type="application/x-ndjson",
-            headers={
-                "Content-Disposition": 'attachment; filename="lsj_training.jsonl"'
-            },
-        )
-
-    content = _to_csv(items, TRAINING_CSV_COLUMNS)
-    return StreamingResponse(
-        io.StringIO(content),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="lsj_training.csv"'},
+    return await export_io.prepare_export_response(
+        transform=lambda rows, budget: _prepare_training_rows(
+            rows, budget=budget, label_field=label_field,
+            exclude_internal=exclude_internal, exclude_auth_pages=exclude_auth_pages,
+            exclude_search_pages=exclude_search_pages, dedup_by_input=dedup_by_input,
+            max_input_len=max_input_len),
+        from_ts=from_ts, to_ts=to_ts, limit_rows=limit_rows, fmt=fmt,
+        columns=TRAINING_CSV_COLUMNS,
+        metadata=None if bare else {"label_field": label_field, "from_ts": from_ts, "to_ts": to_ts},
+        filename="lsj_training",
     )
 
 

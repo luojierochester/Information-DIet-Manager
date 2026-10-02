@@ -22,6 +22,7 @@ TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 EXTENSION_ORIGIN = r"chrome-extension://[a-p]{32}"
 DEFAULT_ORIGINS = "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:4173,http://localhost:4173"
 BODY_LIMITS = {"/collect": 64 * 1024, "/import": 10 * 1024 * 1024, "/data/restore": 20 * 1024 * 1024}
+EXPORT_PATHS = frozenset({"/export/lsj", "/export/lsj/training"})
 
 
 @contextmanager
@@ -202,9 +203,21 @@ class LocalAccessMiddleware:
             except TimeoutError:
                 return await JSONResponse({"detail": "Request capacity reached; retry later"}, status_code=503,
                                           headers={"Retry-After": "5"})(scope, receive, protected_send)
+            export_slot = None
             try:
+                if scope["method"] == "GET" and scope["path"] in EXPORT_PATHS:
+                    export_slot = scope["app"].state.export_slots
+                    # Do not queue exports behind slow consumers or consume
+                    # every general request slot waiting for an export slot.
+                    if export_slot.locked():
+                        export_slot = None
+                        return await JSONResponse({"detail": "Export capacity reached; retry later"}, status_code=503,
+                                                  headers={"Retry-After": "5"})(scope, receive, protected_send)
+                    await export_slot.acquire()
                 return await bounded(scope, receive, protected_send)
             finally:
+                if export_slot is not None:
+                    export_slot.release()
                 slots.release()
 
         async def bounded(scope, receive, protected_send):
@@ -258,6 +271,13 @@ class LocalAccessMiddleware:
                 nonlocal response_started
                 if message["type"] == "http.response.start":
                     response_started = True
+                    if (scope["method"] == "GET" and scope["path"] in EXPORT_PATHS
+                            and scope.get("idm_export_ready") is True and message["status"] == 200):
+                        # The complete bounded artifact owns no DB connection.
+                        # Slow downloads retain only their export/request slots.
+                        for gate in reversed(acquired):
+                            gate.release()
+                        acquired.clear()
                 await protected_send(message)
 
             try:
