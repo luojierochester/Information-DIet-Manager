@@ -1035,6 +1035,16 @@ def import_items(file: UploadFile = File(...)) -> IngestAck:
     return IngestAck(inserted=inserted, duplicates=duplicates, failed=failed)
 
 
+def _read_stored_item_json(value: Any) -> Any:
+    """Apply shared JSON safety checks without imposing ingest-field shapes."""
+    try:
+        return load_analysis_json(value)
+    except InvalidStoredAnalysis:
+        raise HTTPException(409, detail={
+            "code": "stored_item_invalid", "message": "Stored item JSON is invalid.",
+        }) from None
+
+
 @app.get("/items")
 def list_items(
     page: int = Query(1, ge=1),
@@ -1066,16 +1076,8 @@ def list_items(
     items: List[Dict[str, Any]] = []
     for row in rows:
         item: Dict[str, Any] = dict(row)
-        if item.get("tags"):
-            try:
-                item["tags"] = json.loads(item["tags"])
-            except json.JSONDecodeError:
-                item["tags"] = None
-        if item.get("meta"):
-            try:
-                item["meta"] = json.loads(item["meta"])
-            except json.JSONDecodeError:
-                item["meta"] = None
+        for field in ("tags", "meta"):
+            item[field] = _read_stored_item_json(item.get(field))
         items.append(item)
     return {**metadata, "items": items}
 

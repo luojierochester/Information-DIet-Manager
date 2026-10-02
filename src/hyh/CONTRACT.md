@@ -89,6 +89,8 @@ Backend normalization:
   - cursors are signed metadata, not credentials; restart invalidates outstanding cursors and access still requires the admin key
   - keep page size unchanged; do not mix cursor and legacy page/limit parameters
 
+Both pagination modes preserve legitimate stored `tags`/`meta` JSON values, including SQL NULL, JSON null, zero and older valid shapes. Malformed JSON, non-finite numbers (including exponent overflow), invalid UTF-8 text and more than 64 nested containers return `409` with `detail.code: "stored_item_invalid"`. A returned page fails as a whole without disclosing the invalid value or rewriting records/revisions. This is distinct from cursor expiry; a valid earlier page remains readable when only a later page contains invalid JSON. These checks do not enforce the current ingestion business schema on older records or impose a byte/RSS budget.
+
 ### 3.2 Stats (lightweight)
 - `POST /analyze/run?force=false&backfill_limit=2000`
   - fast aggregate without full algorithm pipeline
