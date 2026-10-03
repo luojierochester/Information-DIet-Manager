@@ -30,6 +30,7 @@ from .visualization_metrics import finite_metric
 from . import export_io
 from .owned_work import WorkOwner, run_owned_sync
 from .analysis_json import InvalidStoredAnalysis, load_analysis_json, validate_analysis_value
+from .full_analysis_contract import valid_full_analysis_cache
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -631,8 +632,19 @@ def _run_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not execution.get("ok"):
         raise AnalysisUnavailableError("Experimental analysis is unavailable.")
 
-    evaluator = execution["evaluator"]
     df3 = execution["df3"]
+    # Scores and adjacent comparisons must describe the original input sequence.
+    # Broken adapter output is an internal failure, not incomplete measurements.
+    try:
+        aligned = (type(execution.get("input_count")) is int
+                   and execution["input_count"] == len(rows) and len(df3) == len(rows)
+                   and df3["id"].tolist() == [row["id"] for row in rows]
+                   and df3["ts"].tolist() == [row["ts"] for row in rows])
+    except Exception:
+        aligned = False
+    if not aligned:
+        raise RuntimeError("Pipeline record alignment changed")
+    evaluator = execution["evaluator"]
     quick = evaluator.quick_evaluate(df3)
     report = evaluator.evaluate(df3, detailed=False).to_dict()
 
@@ -667,7 +679,7 @@ def _run_lsj_pipeline(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         str(k): int(v) for k, v in category_norm.value_counts().to_dict().items()
     }
     return {
-        "input_count": int(execution["input_count"]),
+        "input_count": len(rows),
         "category_counts": category_counts,
         "sentiment_counts": sentiment_counts,
         "comparison_count": len(similarities),
@@ -1394,7 +1406,7 @@ async def run_full_analysis(
     )
 
 
-def _failed_full_response(conn, job_id, started_at, input_count, status, message):
+def _failed_analysis_response(conn, job_id, started_at, input_count, status, message):
     duration = _now_ms() - started_at
     _update_analysis_job(
         conn, job_id, status=JOB_FAILED, error=message,
@@ -1442,11 +1454,10 @@ def _run_full_analysis_snapshot(*, force, from_ts, to_ts, limit_rows):
                 (input_hash, max_created_at, JOB_COMPLETED),
             ).fetchone()
             cached_payload = _load_analysis_cache(cached["result_payload"]) if cached else {}
-            if (cached and isinstance(cached_payload, dict)
-                    and cached_payload.get("statistics_scope") == "analysis_window"
-                    and cached_payload.get("statistics_version") == 2
-                    and cached_payload.get("analysis_status") in {"ready", "empty"}
-                    and not cached_payload.get("pipeline_warning")):
+            if cached and valid_full_analysis_cache(
+                cached_payload, day=day, from_ts=from_ts, to_ts=to_ts,
+                limit_rows=limit_rows, input_count=input_count,
+            ):
                 job_id = _insert_analysis_job(
                     conn,
                     status=JOB_COMPLETED,
@@ -1553,7 +1564,7 @@ def _run_full_analysis_snapshot(*, force, from_ts, to_ts, limit_rows):
         conn.execute("BEGIN IMMEDIATE")
         _require_analysis_revision(conn, revision, job_id=job_id)
         if failure is not None:
-            return _failed_full_response(conn, job_id, started_at, input_count, *failure)
+            return _failed_analysis_response(conn, job_id, started_at, input_count, *failure)
         conn.execute("SAVEPOINT legacy_analysis_result")
         try:
             # Newly published reports must satisfy the same finite, UTF-8 and
@@ -1605,7 +1616,7 @@ def _run_full_analysis_snapshot(*, force, from_ts, to_ts, limit_rows):
         except Exception:
             conn.execute("ROLLBACK TO legacy_analysis_result")
             conn.execute("RELEASE legacy_analysis_result")
-            return _failed_full_response(
+            return _failed_analysis_response(
                 conn, job_id, started_at, input_count, 500,
                 "Legacy analysis failed; no valid result was produced.",
             )
@@ -1804,22 +1815,42 @@ def _dashboard_visualization_snapshot(*, days, from_ts, to_ts, limit_rows, force
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _require_analysis_revision(conn, revision, job_id=job_id)
-        _update_analysis_job(
-            conn,
-            job_id,
-            status=JOB_FAILED if payload["analysis_status"] in {"failed", "unavailable"} else JOB_COMPLETED,
-            result_payload=payload,
-            metrics_json={
-                "input_count": input_count,
-                "cache_hit": False,
-                "mode": "dashboard_visualization",
-                "pipeline_warning": payload.get("pipeline_warning"),
-            },
-            duration_ms=_now_ms() - started_at,
-            started_at=started_at,
-            finished_at=_now_ms(),
-        )
-        return payload
+        conn.execute("SAVEPOINT visualization_result")
+        try:
+            # Validate the persisted JSON representation: hourly keys are
+            # integers in metrics and have always become strings on the wire.
+            # Keep serialization and partial write effects in one boundary.
+            payload = load_analysis_json(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+            _update_analysis_job(
+                conn,
+                job_id,
+                status=JOB_FAILED if payload["analysis_status"] in {"failed", "unavailable"} else JOB_COMPLETED,
+                result_payload=payload,
+                metrics_json={
+                    "input_count": input_count,
+                    "cache_hit": False,
+                    "mode": "dashboard_visualization",
+                    "pipeline_warning": payload.get("pipeline_warning"),
+                },
+                duration_ms=_now_ms() - started_at,
+                started_at=started_at,
+                finished_at=_now_ms(),
+            )
+            conn.execute("RELEASE visualization_result")
+            return payload
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK TO visualization_result")
+                conn.execute("RELEASE visualization_result")
+            else:
+                # SQLite can abort the entire transaction (including its
+                # savepoints). Reacquire and recheck before recording failure.
+                conn.execute("BEGIN IMMEDIATE")
+                _require_analysis_revision(conn, revision, job_id=job_id)
+            return _failed_analysis_response(
+                conn, job_id, started_at, input_count, 500,
+                "Visualization analysis failed; no valid result was produced.",
+            )
 
 
 @app.get("/export/lsj")

@@ -162,6 +162,62 @@ async function run() {
   await showSettings();
   pass('connection and maintenance controls are contained in the original settings panel and hidden on the home page');
 
+  // A real SQLite publication fault, with fewer than five records so optional
+  // inference is never loaded. The API response itself is not intercepted.
+  const publicationState = path.join(temp, 'publication-state.json');
+  const publicationFault = action => command(['-c', [
+    'import json, pathlib, sqlite3, sys',
+    'state_file = pathlib.Path(sys.argv[3])',
+    'with sqlite3.connect(sys.argv[1]) as conn:',
+    '    if sys.argv[2] == "install":',
+    '        state_file.write_text(json.dumps([row[0] for row in conn.execute("SELECT id FROM analysis_jobs")]), encoding="utf-8")',
+    '        conn.execute("CREATE TRIGGER synthetic_ui_publication_failure BEFORE UPDATE ON analysis_jobs WHEN NEW.status = \'completed\' BEGIN SELECT RAISE(FAIL, \'SYNTHETIC_PRIVATE_PUBLICATION_ERROR\'); END")',
+    '    elif sys.argv[2] == "inspect":',
+    '        before = set(json.loads(state_file.read_text(encoding="utf-8")))',
+    '        created = [row[0] for row in conn.execute("SELECT id FROM analysis_jobs") if row[0] not in before]',
+    '        assert len(created) == 1, "The browser must create exactly one analysis job"',
+    '        state_file.write_text(json.dumps({"job_id": created[0]}), encoding="utf-8")',
+    '    else:',
+    '        conn.execute("DROP TRIGGER synthetic_ui_publication_failure")',
+  ].join('\n'), database, action, publicationState], { cwd: root, env: { ...process.env, PYTHONUTF8: '1' } }, process.env.IDM_TEST_PYTHON || 'python');
+  const historyBeforeFailure = await (await fetch(api + '/analyze/history', { headers })).json();
+  await publicationFault('install');
+  try {
+    await hideSettings();
+    const failedResponse = page.waitForResponse(response => response.request().method() === 'GET'
+      && response.url().startsWith(api + '/dashboard/visualization?'));
+    await page.getByTestId('run-analysis').click();
+    const response = await failedResponse;
+    assert.equal(response.status(), 500);
+    assert.equal((await response.allHeaders())['access-control-allow-origin'], uiOrigin);
+    await until(async () => (await page.getByTestId('analysis-status').textContent()).includes('分析请求失败')
+      && !(await page.getByTestId('run-analysis').isDisabled()), 'real publication failure rendered');
+    // The client intentionally ignores 500 bodies; Chromium may discard that
+    // unread body. Identify this request's job from the disposable DB, then
+    // inspect its public API representation instead of depending on DevTools.
+    await publicationFault('inspect');
+    const { job_id: failedJobId } = JSON.parse(fs.readFileSync(publicationState, 'utf8'));
+    const failedJobResponse = await fetch(api + '/analyze/jobs/' + failedJobId, { headers });
+    assert.equal(failedJobResponse.status, 200);
+    const failedJob = await failedJobResponse.json();
+    assert.equal(failedJob.status, 'failed');
+    assert.equal(failedJob.result_payload, null);
+    assert.equal(failedJob.error, 'Visualization analysis failed; no valid result was produced.');
+    assert.equal(JSON.stringify(failedJob).includes('SYNTHETIC_PRIVATE_PUBLICATION_ERROR'), false);
+    assert.equal((await page.locator('body').textContent()).includes('SYNTHETIC_PRIVATE_PUBLICATION_ERROR'), false);
+    assert.deepEqual(await (await fetch(api + '/analyze/history', { headers })).json(), historyBeforeFailure);
+    assert.equal(await savedTotal.textContent(), '2');
+  } finally {
+    await publicationFault('remove');
+  }
+  const recoveredResponse = page.waitForResponse(response => response.request().method() === 'GET'
+    && response.url().startsWith(api + '/dashboard/visualization?'));
+  await page.getByTestId('run-analysis').click();
+  assert.equal((await recoveredResponse).status(), 200);
+  await until(async () => (await page.getByTestId('analysis-status').textContent()).includes('样本不足'), 'publication retry recovers without inventing analysis');
+  await showSettings();
+  pass('real analysis publication failure shows no result, persists a failed job without private errors, and permits an honest retry');
+
   // Synthetic analysis response checks rendering only. No model inference is
   // exercised by this fixture; lifecycle requests below still use the real API.
   const fixtureCategories = ['entertainment', 'learning', 'news', 'social', 'shopping', 'tools', 'other'];
