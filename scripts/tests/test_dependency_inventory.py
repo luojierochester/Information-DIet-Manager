@@ -20,6 +20,20 @@ HASH_A, HASH_B = "a" * 64, "b" * 64
 INTEGRITY = "sha512-" + base64.b64encode(b"x" * 64).decode("ascii")
 
 
+def provenance(lf):
+    commit = "2b" * 20
+    return {
+        "schema_version": 1, "local_path": inventory.VENDOR_PATH,
+        "repository": "https://github.com/mozilla/readability", "upstream_path": "Readability.js",
+        "upstream_commit": commit,
+        "upstream_raw_url": f"https://raw.githubusercontent.com/mozilla/readability/{commit}/Readability.js",
+        "reviewed_on": "2026-10-03", "comparison_policy": "lf-or-crlf-only",
+        "files": {kind: {"sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
+                  for kind, data in (("lf", lf), ("crlf", lf.replace(b"\n", b"\r\n")))},
+        "release_version": None, "upstream_package_version": "0.0.0", "verified_license": None,
+    }
+
+
 def lock(pins, hashes=(HASH_A,)):
     return "\n".join(f"{name}=={version} " + " ".join(f"--hash=sha256:{value}" for value in hashes)
                      for name, version in pins.items()) + "\n"
@@ -59,6 +73,7 @@ class DependencyInventoryTests(unittest.TestCase):
             self.put_json(f"{directory}/package-lock.json", locked)
         self.put_json(inventory.EXTENSION_MANIFEST, {"content_scripts": [{"js": ["readability.js", "content.js"]}]})
         self.put(inventory.VENDOR_PATH, "/* Synthetic license declaration */\n/* Based on ancestor 1.7.1 */\nfunction Readability() {}\n")
+        self.put_json(inventory.PROVENANCE_PATH, provenance((self.root / inventory.VENDOR_PATH).read_bytes()))
 
     def put(self, name, text):
         (self.root / name).write_bytes(text.encode("utf-8"))
@@ -90,7 +105,11 @@ class DependencyInventoryTests(unittest.TestCase):
         self.assertIsNone(vendor["verified_source"])
         self.assertIsNone(vendor["verified_license"])
         self.assertIn("ancestor 1.7.1", vendor["header_declarations"])
+        self.assertEqual(vendor["source_match"]["method"], "byte-identical")
+        self.assertEqual(vendor["source_match"]["metadata"], inventory.PROVENANCE_PATH)
+        self.assertEqual(vendor["source_match"]["upstream_package_version_declaration"], "0.0.0")
         self.assertIn("not a Git lookup", result["evidence"]["revision_semantics"])
+        self.assertIn("Offline byte correspondence", result["evidence"]["source_match_semantics"])
 
     def test_reads_only_fixed_inputs_and_fingerprints_exact_bytes(self):
         original = Path.read_bytes
@@ -271,12 +290,134 @@ class DependencyInventoryTests(unittest.TestCase):
 
     def test_vendor_reference_and_header_change_do_not_invent_provenance(self):
         self.put(inventory.VENDOR_PATH, "function Readability() {}\n")
+        self.put_json(inventory.PROVENANCE_PATH, provenance((self.root / inventory.VENDOR_PATH).read_bytes()))
         vendor = self.build()["vendored_files"][0]
         self.assertIsNone(vendor["header_declarations"])
         self.assertIsNone(vendor["version"])
         self.put_json(inventory.EXTENSION_MANIFEST, {"content_scripts": [{"js": ["content.js"]}]})
         with self.assertRaises(ValueError):
             self.build()
+
+    def test_lf_and_crlf_source_matches_keep_actual_raw_hash_distinct(self):
+        source = self.root / inventory.VENDOR_PATH
+        lf = source.read_bytes()
+        first = self.build()
+        source.write_bytes(lf.replace(b"\n", b"\r\n"))
+        second = self.build()
+        vendor_lf, vendor_crlf = first["vendored_files"][0], second["vendored_files"][0]
+        self.assertEqual(first["schema_version"], 2)
+        self.assertEqual(len(first["inputs"]), 14)
+        self.assertEqual(vendor_lf["source_match"]["method"], "byte-identical")
+        self.assertEqual(vendor_crlf["source_match"]["method"], "crlf-only")
+        self.assertEqual(vendor_lf["source_match"]["upstream_lf"], vendor_crlf["source_match"]["upstream_lf"])
+        self.assertNotEqual(vendor_lf["sha256"], vendor_crlf["sha256"])
+        self.assertEqual(vendor_crlf["sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertNotEqual(first["inputs"], second["inputs"])
+
+    def test_source_changes_fail_before_replacing_old_output_or_updating_metadata(self):
+        source = self.root / inventory.VENDOR_PATH
+        lf = source.read_bytes()
+        metadata_before = (self.root / inventory.PROVENANCE_PATH).read_bytes()
+        output = self.root / "inventory.json"
+        inventory.write_inventory(self.build(), output, root=self.root)
+        before = output.read_bytes()
+        invalid_sources = (lf.replace(b"Readability", b"Other_Name", 1), b"\xef\xbb\xbf" + lf,
+                           lf.replace(b"\n", b"\r"), lf.replace(b"\n", b"\r\n", 1), lf.rstrip(b"\n"), b"")
+        for raw in invalid_sources:
+            with self.subTest(raw=raw):
+                source.write_bytes(raw)
+                with patch.object(inventory, "ROOT", self.root), self.assertRaises(SystemExit) as error:
+                    inventory.main(["--revision", REVISION, "--output", str(output)])
+                self.assertEqual(error.exception.code, 1)
+                self.assertEqual(output.read_bytes(), before)
+                self.assertEqual((self.root / inventory.PROVENANCE_PATH).read_bytes(), metadata_before)
+                self.assertEqual(list(self.root.glob(".inventory.json.*.tmp")), [])
+
+    def test_provenance_fields_are_closed_typed_and_cannot_claim_release_or_license(self):
+        original = self.read_json(inventory.PROVENANCE_PATH)
+        variants = []
+        for key in original:
+            value = copy.deepcopy(original)
+            del value[key]
+            variants.append(value)
+        for key, bad in (("schema_version", True), ("schema_version", 2), ("local_path", "../private.js"),
+                         ("repository", "https://example.invalid/readability"), ("upstream_path", "../Readability.js"),
+                         ("upstream_commit", "main"), ("upstream_commit", "G" * 40),
+                         ("upstream_raw_url", original["upstream_raw_url"].replace("2b" * 20, "3c" * 20)),
+                         ("upstream_raw_url", "file:private.js"), ("reviewed_on", "2026-02-30"),
+                         ("reviewed_on", True), ("comparison_policy", "ignore-all-whitespace"),
+                         ("release_version", "0.6.0"), ("verified_license", "Apache-2.0"),
+                         ("upstream_package_version", None), ("extra", "unsupported")):
+            variants.append({**original, key: bad})
+        for value in variants:
+            with self.subTest(value=value):
+                self.put_json(inventory.PROVENANCE_PATH, value)
+                with self.assertRaises(ValueError):
+                    self.build()
+
+    def test_provenance_fingerprints_validate_both_newline_forms_and_reject_bool_sizes(self):
+        original = self.read_json(inventory.PROVENANCE_PATH)
+        variants = []
+        for kind in ("lf", "crlf"):
+            for key, bad in (("sha256", HASH_A), ("sha256", "bad"), ("sha256", False),
+                             ("size_bytes", True), ("size_bytes", 0), ("size_bytes", -1),
+                             ("size_bytes", 1.5), ("size_bytes", "12"), ("extra", 1)):
+                value = copy.deepcopy(original)
+                value["files"][kind][key] = bad
+                variants.append(value)
+            value = copy.deepcopy(original)
+            del value["files"][kind]
+            variants.append(value)
+        variants.append({**original, "files": []})
+        for value in variants:
+            with self.subTest(value=value):
+                self.put_json(inventory.PROVENANCE_PATH, value)
+                with self.assertRaises(ValueError):
+                    self.build()
+
+    def test_matching_raw_fingerprint_does_not_allow_unapproved_normalization(self):
+        source = self.root / inventory.VENDOR_PATH
+        lf = source.read_bytes()
+        for invalid in (b"\xef\xbb\xbf" + lf, lf.replace(b"\n", b"\r")):
+            with self.subTest(invalid=invalid):
+                source.write_bytes(invalid)
+                self.put_json(inventory.PROVENANCE_PATH, provenance(invalid))
+                with self.assertRaises(ValueError):
+                    self.build()
+        mixed = lf.replace(b"\n", b"\r\n", 1)
+        value = provenance(lf)
+        value["files"]["crlf"] = {"sha256": hashlib.sha256(mixed).hexdigest(), "size_bytes": len(mixed)}
+        source.write_bytes(mixed)
+        self.put_json(inventory.PROVENANCE_PATH, value)
+        with self.assertRaises(ValueError):
+            self.build()
+
+    def test_provenance_input_fingerprint_tracks_review_metadata_and_cannot_be_overwritten(self):
+        before = self.build()
+        original = self.read_json(inventory.PROVENANCE_PATH)
+        updated = {**original, "reviewed_on": "2026-10-02"}
+        self.put_json(inventory.PROVENANCE_PATH, updated)
+        after = self.build()
+        before_hashes = {row["path"]: row["sha256"] for row in before["inputs"]}
+        after_hashes = {row["path"]: row["sha256"] for row in after["inputs"]}
+        self.assertNotEqual(before_hashes[inventory.PROVENANCE_PATH], after_hashes[inventory.PROVENANCE_PATH])
+        self.assertEqual(before_hashes[inventory.VENDOR_PATH], after_hashes[inventory.VENDOR_PATH])
+        source_bytes = (self.root / inventory.PROVENANCE_PATH).read_bytes()
+        with self.assertRaisesRegex(ValueError, "overwrite"):
+            inventory.write_inventory(after, self.root / inventory.PROVENANCE_PATH, root=self.root)
+        self.assertEqual((self.root / inventory.PROVENANCE_PATH).read_bytes(), source_bytes)
+
+    def test_duplicate_or_invalid_provenance_json_preserves_old_inventory(self):
+        output = self.root / "inventory.json"
+        inventory.write_inventory(self.build(), output, root=self.root)
+        before = output.read_bytes()
+        for text in ('{"schema_version":1,"schema_version":1}', '{"schema_version":NaN}', '{broken}'):
+            with self.subTest(text=text):
+                self.put(inventory.PROVENANCE_PATH, text)
+                with patch.object(inventory, "ROOT", self.root), self.assertRaises(SystemExit) as error:
+                    inventory.main(["--revision", REVISION, "--output", str(output)])
+                self.assertEqual(error.exception.code, 1)
+                self.assertEqual(output.read_bytes(), before)
 
     def test_missing_input_fails_instead_of_partial_inventory(self):
         (self.root / inventory.VENDOR_PATH).unlink()
@@ -351,6 +492,9 @@ class DependencyInventoryTests(unittest.TestCase):
         actual = json.loads(first.read_bytes())
         self.assertEqual([row["path"] for row in actual["inputs"]], list(inventory.INPUT_PATHS))
         self.assertEqual(actual["vendored_files"][0]["path"], inventory.VENDOR_PATH)
+        self.assertEqual(actual["vendored_files"][0]["source_match"]["upstream_commit"],
+                         "d7949dc47dd9ed9ee1d3b34ffdcf3bce28cde435")
+        self.assertIn(actual["vendored_files"][0]["source_match"]["method"], ("byte-identical", "crlf-only"))
         self.assertEqual(set(actual["npm"]), {"frontend", "extension-test"})
 
 

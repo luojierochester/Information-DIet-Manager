@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import date
 import hashlib
 import json
 import os
@@ -22,8 +23,8 @@ else:
     from verify_python_dependencies import PIN, compare, normalized_name, parse_lock
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 1
-GENERATOR_VERSION = "1.0.0"
+SCHEMA_VERSION = 2
+GENERATOR_VERSION = "1.1.0"
 PYTHON_LOCKS = {
     "runtime": "requirements/locks/runtime-windows-py312.txt",
     "test": "requirements/locks/test-windows-py312.txt",
@@ -37,9 +38,10 @@ DIRECT_INPUTS = {
 }
 NPM_ROOTS = {"frontend": "frontend", "extension-test": "chrome-extension"}
 VENDOR_PATH = "chrome-extension/readability.js"
+PROVENANCE_PATH = "chrome-extension/readability.provenance.json"
 EXTENSION_MANIFEST = "chrome-extension/manifest.json"
 INPUT_PATHS = tuple(sorted({
-    *PYTHON_LOCKS.values(), *DIRECT_INPUTS.values(), VENDOR_PATH, EXTENSION_MANIFEST,
+    *PYTHON_LOCKS.values(), *DIRECT_INPUTS.values(), VENDOR_PATH, PROVENANCE_PATH, EXTENSION_MANIFEST,
     *(f"{directory}/{filename}" for directory in NPM_ROOTS.values()
       for filename in ("package.json", "package-lock.json")),
 }))
@@ -232,6 +234,62 @@ def _npm_inventory(manifest: dict[str, Any], lock: dict[str, Any]) -> dict[str, 
             "direct_declarations": direct, "packages": records}
 
 
+def _source_match(metadata: dict[str, Any], raw: bytes) -> dict[str, Any]:
+    """Check only the bytes against reviewed metadata, never fetch its URL."""
+    fields = {"schema_version", "local_path", "repository", "upstream_path", "upstream_commit",
+              "upstream_raw_url", "reviewed_on", "comparison_policy", "files", "release_version",
+              "upstream_package_version", "verified_license"}
+    _require(set(metadata) == fields, "Provenance must have exactly the supported fields")
+    _require(type(metadata["schema_version"]) is int and metadata["schema_version"] == 1,
+             "Unsupported provenance schema version")
+    for field, expected in (("local_path", VENDOR_PATH), ("repository", "https://github.com/mozilla/readability"),
+                            ("upstream_path", "Readability.js"), ("comparison_policy", "lf-or-crlf-only")):
+        _require(metadata[field] == expected, f"Unsupported provenance {field}")
+    commit = metadata["upstream_commit"]
+    _require(isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
+             "Provenance commit must be a full lowercase 40-hex identifier")
+    _require(metadata["upstream_raw_url"] == f"https://raw.githubusercontent.com/mozilla/readability/{commit}/Readability.js",
+             "Provenance raw URL must match the immutable commit and path")
+    reviewed_on = metadata["reviewed_on"]
+    _require(isinstance(reviewed_on, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", reviewed_on) is not None,
+             "Invalid provenance review date")
+    date.fromisoformat(reviewed_on)
+    _require(metadata["release_version"] is None and metadata["verified_license"] is None,
+             "This provenance schema cannot assert a verified release or license")
+    _version(metadata["upstream_package_version"])
+    files = _object(metadata["files"], "provenance files")
+    _require(set(files) == {"lf", "crlf"}, "Provenance requires exactly LF and CRLF fingerprints")
+    for fingerprint in files.values():
+        fingerprint = _object(fingerprint, "provenance fingerprint")
+        _require(set(fingerprint) == {"sha256", "size_bytes"}, "Invalid provenance fingerprint fields")
+        _require(isinstance(fingerprint["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint["sha256"]) is not None,
+                 "Invalid provenance SHA-256")
+        _require(type(fingerprint["size_bytes"]) is int and fingerprint["size_bytes"] > 0,
+                 "Provenance byte size must be a positive integer")
+
+    def matches(data: bytes, kind: str) -> bool:
+        return len(data) == files[kind]["size_bytes"] and hashlib.sha256(data).hexdigest() == files[kind]["sha256"]
+
+    if matches(raw, "lf"):
+        method, lf = "byte-identical", raw
+    elif matches(raw, "crlf"):
+        method, lf = "crlf-only", raw.replace(b"\r\n", b"\n")
+    else:
+        raise ValueError("Vendored Readability bytes do not match reviewed provenance")
+    _require(not lf.startswith(b"\xef\xbb\xbf") and b"\r" not in lf and b"\n" in lf,
+             "Provenance accepts LF bytes without BOM or bare CR")
+    crlf = lf.replace(b"\n", b"\r\n")
+    _require(matches(lf, "lf") and matches(crlf, "crlf"), "Provenance LF/CRLF fingerprints are inconsistent")
+    _require(method != "crlf-only" or raw == crlf, "Provenance permits only complete CRLF-to-LF conversion")
+    return {
+        "method": method, "metadata": PROVENANCE_PATH, "repository": metadata["repository"],
+        "upstream_path": metadata["upstream_path"], "upstream_commit": commit,
+        "upstream_raw_url": metadata["upstream_raw_url"], "reviewed_on": reviewed_on,
+        "upstream_lf": files["lf"], "upstream_package_version_declaration": metadata["upstream_package_version"],
+        "release_version": None,
+    }
+
+
 def build_inventory(root: Path, revision: str) -> dict[str, Any]:
     _require(isinstance(revision, str) and re.fullmatch(r"[0-9a-fA-F]{40}", revision) is not None,
              "revision must be a full 40-character hexadecimal label")
@@ -264,6 +322,7 @@ def build_inventory(root: Path, revision: str) -> dict[str, Any]:
     _require(isinstance(scripts, list) and all(isinstance(entry, dict) and isinstance(entry.get("js"), list)
              and all(isinstance(js, str) for js in entry["js"]) for entry in scripts), "Invalid extension content_scripts")
     _require(any("readability.js" in entry["js"] for entry in scripts), "Vendored readability.js is not referenced by manifest")
+    source_match = _source_match(_json(texts[PROVENANCE_PATH], PROVENANCE_PATH), inputs[VENDOR_PATH])
     header = re.match(r"\s*(/\*.*?\*/\s*/\*.*?\*/)", texts[VENDOR_PATH], flags=re.DOTALL)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -274,14 +333,16 @@ def build_inventory(root: Path, revision: str) -> dict[str, Any]:
                      "hash_semantics": "Raw input bytes and allowed package hashes; not proof of the actually installed artifacts",
                      "python_runtime_subset_of_test": True,
                      "npm_scope": "Lock package paths and direct declarations; not a resolved transitive graph or built dist contents",
-                     "license_status": "Declarations only; no project license choice or license/provenance verification",
+                     "license_status": "Declarations only; no project license choice or license verification",
+                     "source_match_semantics": "Offline byte correspondence to reviewed metadata; not a signature, original download channel or unique source commit proof",
                      "excluded": ["installed environments", "optional model/analysis/training environments", "model weights and tokenizers",
                                   "browser binaries", "operating system and interpreter binaries", "personal data", "distribution file inventory"]},
         "inputs": [{"path": name, "sha256": hashlib.sha256(data).hexdigest()} for name, data in sorted(inputs.items())],
         "python": python, "npm": npm,
         "vendored_files": [{"path": VENDOR_PATH, "sha256": hashlib.sha256(inputs[VENDOR_PATH]).hexdigest(),
                             "referenced_by": EXTENSION_MANIFEST, "version": None, "verified_source": None,
-                            "verified_license": None, "header_declarations": header[1] if header else None}],
+                            "verified_license": None, "source_match": source_match,
+                            "header_declarations": header[1] if header else None}],
     }
 
 
