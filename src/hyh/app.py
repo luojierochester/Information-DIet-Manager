@@ -786,26 +786,13 @@ def _load_analysis_cache(value: Any) -> Dict[str, Any]:
         return {}
 
 
-def _safe_json_loads(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, (dict, list)):
-        return value
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
 def _shape_export_rows(rows: Iterable[Dict[str, Any]], view: str) -> Iterable[Dict[str, Any]]:
     for r in rows:
         title = _clean_optional_str(r.get("title")) or ""
         text = _clean_optional_str(r.get("text")) or title
 
-        tags = _safe_json_loads(r.get("tags"))
-        meta = _safe_json_loads(r.get("meta"))
+        tags = load_analysis_json(r.get("tags"))
+        meta = load_analysis_json(r.get("meta"))
 
         if view == "analysis":
             yield {
