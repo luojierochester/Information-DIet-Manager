@@ -191,7 +191,7 @@ class CntextSentimentBackend:
             )
 
         except Exception as e:
-            logger.exception(f"情感分析失败: {e}")
+            logger.error("情感分析失败 (%s)", type(e).__name__)
             return SentimentScore(valid=False)
 
     def analyze_emotions(self, text: str) -> Dict[str, int]:
@@ -676,7 +676,7 @@ class SentimentAnalyzer:
         try:
             words = jieba.lcut(str(text))
         except Exception as e:
-            logger.exception(f"出现异常，分词失败: {e}")
+            logger.error("分词失败 (%s)", type(e).__name__)
             return []
 
         stopwords_set = self._load_stopwords()

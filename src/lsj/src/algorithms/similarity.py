@@ -126,7 +126,7 @@ class SimilarityAnalyzer:
             filtered = [w for w in words if w.strip() and w not in self.stopwords]
             return filtered
         except Exception as e:
-            logger.error(f"分词失败: {e}")
+            logger.error("分词失败 (%s)", type(e).__name__)
             return []
 
     def _load_word_vectors(self, model_path: str) -> None:
