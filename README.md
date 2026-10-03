@@ -100,6 +100,8 @@ npm run dev -- --host 127.0.0.1 --strictPort
 .\.venv\Scripts\python.exe scripts/rotate_local_keys.py
 ```
 
+加 `--help` 或 `-h` 只显示帮助；未知参数会被拒绝，这些情况都不会轮换密钥或创建数据目录。
+
 重启服务，并分别在界面和扩展更新密钥。脚本沿用 `IDM_DB_PATH`，不会修改页面记录；服务仍在运行时会拒绝轮换。高级配置可同时提供两个不同的 `IDM_ADMIN_TOKEN` / `IDM_COLLECTOR_TOKEN`，此时须自行更新这两个环境变量；不能通过空值关闭认证。详见 [安全边界与恢复说明](docs/local-security-and-recovery.md)。
 
 ### Chrome 扩展
