@@ -2,10 +2,9 @@
 
 Transport allocation owns a temporary file handle so missed close calls are
 observable without opening sockets, reading personal configuration, or models.
-The synthetic transport deliberately supports retry after a failed/cancelled
-close. Those assertions verify wrapper ownership, not recovery of real HTTPX:
-HTTPX may mark itself closed before transport cleanup fails, then make a second
-aclose() a no-op. A normal retry return does not prove transport cleanup.
+Failed or cancelled closes must keep an explicit failed state and reference;
+even a retry-capable synthetic transport cannot establish public HTTPX recovery.
+Actual HTTPX with synthetic transports is covered by test_collector_http_close_state.
 """
 import asyncio
 from copy import deepcopy
@@ -19,6 +18,7 @@ import pytest
 
 
 UTILS = Path(__file__).resolve().parents[1] / "src" / "algorithms" / "utils"
+CLOSE_ERROR = "Model client cleanup previously failed; resource state is unknown."
 
 
 @pytest.fixture(params=["classifier", "sentiment"])
@@ -311,7 +311,7 @@ def test_close_before_use_is_safe_and_does_not_reopen(context):
 
 
 @pytest.mark.parametrize("failure", ["exception", "cancelled"])
-def test_failed_close_retains_resource_for_retry_and_blocks_generate(context, failure):
+def test_failed_close_remains_failed_and_blocks_generate(context, failure):
     client = context.client()
     primary = (OSError("Synthetic close failure.") if failure == "exception"
                else asyncio.CancelledError("Synthetic close cancellation."))
@@ -328,9 +328,13 @@ def test_failed_close_retains_resource_for_retry_and_blocks_generate(context, fa
             await client.generate("synthetic", 0.5, 10)
         assert len(context.state.posts) == posts_before
         assert len(context.state.created) == 1
-        await client.close()
-        await client.close()
-        assert transport.resource.closed and transport.close_calls == 2
+        for _ in range(2):
+            with pytest.raises(RuntimeError) as repeated:
+                await client.close()
+            assert str(repeated.value) == CLOSE_ERROR
+            assert repeated.value.__cause__ is None
+            assert client.http is transport
+        assert not transport.resource.closed and transport.close_calls == 1
 
     asyncio.run(run())
 
@@ -353,15 +357,19 @@ def test_pool_close_attempts_other_transports_and_preserves_first_error(context,
         assert raised.value is primary
         assert [item.close_calls for item in context.state.created] == [1, 1]
         assert not first.resource.closed and not second.resource.closed
-        await pool.close()
-        await pool.close()
-        assert [item.close_calls for item in context.state.created] == [2, 2]
-        assert first.resource.closed and second.resource.closed
+        for _ in range(2):
+            with pytest.raises(RuntimeError) as repeated:
+                await pool.close()
+            assert str(repeated.value) == CLOSE_ERROR
+        assert [item.close_calls for item in context.state.created] == [1, 1]
+        assert not first.resource.closed and not second.resource.closed
+        assert pool.clients[configs[0].name].http is first
+        assert pool.clients[configs[1].name].http is second
 
     asyncio.run(run())
 
 
-def test_actual_task_cancellation_during_close_retains_retryable_resource(context):
+def test_actual_task_cancellation_during_close_keeps_failed_state(context):
     client = context.client()
 
     async def run():
@@ -385,9 +393,12 @@ def test_actual_task_cancellation_during_close_retains_retryable_resource(contex
                 await client.generate("synthetic", 0.5, 10)
             assert len(context.state.created) == 1 and len(context.state.posts) == 1
             transport.close_hook = None
-            await client.close()
-            await client.close()
-            assert transport.resource.closed and transport.close_calls == 2
+            for _ in range(2):
+                with pytest.raises(RuntimeError) as repeated:
+                    await client.close()
+                assert str(repeated.value) == CLOSE_ERROR
+            assert client.http is transport
+            assert not transport.resource.closed and transport.close_calls == 1
         finally:
             if not task.done():
                 task.cancel()

@@ -614,6 +614,8 @@ class BaseModelClient:
         self.cfg = cfg
         self.http: Optional[httpx.AsyncClient] = None
         self._closed = False
+        self._close_failed = False
+        self._close_lock = asyncio.Lock()
         self.last_request_ts = 0.0
         self.min_interval = 1.0 / max(0.1, cfg.qps_limit)
         self._rate_limit_lock = asyncio.Lock()
@@ -640,10 +642,18 @@ class BaseModelClient:
 
     async def close(self):
         self._closed = True
-        if self.http is not None:
-            # Retain the reference if close fails or is cancelled so it can be retried.
-            await self.http.aclose()
-            self.http = None
+        async with self._close_lock:
+            if self._close_failed:
+                raise RuntimeError("Model client cleanup previously failed; resource state is unknown.") from None
+            if self.http is not None:
+                try:
+                    await self.http.aclose()
+                except BaseException:
+                    # HTTPX may already mark itself closed; another aclose can
+                    # be a no-op, so retain ownership and the failed state.
+                    self._close_failed = True
+                    raise
+                self.http = None
 
 
 class OpenAIClient(BaseModelClient):
