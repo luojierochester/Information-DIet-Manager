@@ -158,7 +158,9 @@ npm run test:e2e
 
 测试使用临时数据库和合成密钥。模型输出相关契约测试使用合成结果，与真实推理验收分开记录。扩展与前端验收共用 `chrome-extension` 中锁定的 Playwright 和下载的 Chrome for Testing，不会操作日常 Chrome 配置；它们会在系统临时目录保留合成资料，截图和结果分别写入被 Git 忽略的 `output/playwright/round2/` 和 `output/playwright/display-correctness/`。前端浏览器测试会启动临时后端、构建并服务真实生产页面。
 
-Windows CI 会执行上述 Python、扩展与前端单元/浏览器测试及构建，并通过官方服务审计前端、扩展和最小 Python 环境的完整依赖树；查询或解析失败也会阻断。最新结果与后续优先级见 [安全与数据显示改进](docs/security-display-2026-10-03.md)；依赖范围见 [依赖审计记录](docs/dependency-security-2026-10-03.md)。历史基线见 [第三轮](docs/round-3-improvements.md)、[第二轮](docs/round-2-improvements.md) 和 [第一轮](docs/round-1-improvements.md)。
+Windows CI 会执行上述 Python、扩展与前端单元/浏览器测试及构建，并通过官方服务审计前端、扩展和最小 Python 环境的完整依赖树；查询或解析失败也会阻断。最新结果与后续优先级见 [质量状态](docs/quality-status-2026-10-03.md)；依赖范围见 [依赖审计记录](docs/dependency-security-2026-10-03.md)。历史基线见 [第三轮](docs/round-3-improvements.md)、[第二轮](docs/round-2-improvements.md) 和 [第一轮](docs/round-1-improvements.md)。
+
+全部检查通过后，CI 会核对提交与工作区，生成两次离线依赖清单并比较文件哈希，将清单作为该次运行的 `dependency-inventory-<完整提交SHA>` 附件保留 30 天。清单分别列出运行、测试、维护及安装工具的锁定组件，保留输入文件和扩展 Readability 源码的哈希；它不代表正式 SBOM、实际构建产物清单或模型环境验收。范围及本地命令见 [依赖清单说明](docs/dependency-inventory-2026-10-03.md)。
 
 ## 当前发布边界
 

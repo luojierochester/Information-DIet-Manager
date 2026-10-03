@@ -143,3 +143,32 @@ jobs:
       - name: Verify authenticated UI and data recovery
         working-directory: frontend
         run: npm run test:e2e
+
+      - name: Generate and reproduce the scoped dependency inventory
+        shell: pwsh
+        run: |
+          $inventoryRevision = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $inventoryRevision -ne $env:GITHUB_SHA) {
+            throw 'Dependency inventory revision does not match the checked-out commit.'
+          }
+          git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked inputs changed during validation.' }
+          $inventoryPath = Join-Path $env:RUNNER_TEMP 'idm-dependency-inventory.json'
+          $inventoryRepeatPath = Join-Path $env:RUNNER_TEMP 'idm-dependency-inventory-repeat.json'
+          python scripts/generate_dependency_inventory.py --revision $env:GITHUB_SHA --output $inventoryPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/generate_dependency_inventory.py --revision $env:GITHUB_SHA --output $inventoryRepeatPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $inventoryHash = (Get-FileHash -LiteralPath $inventoryPath -Algorithm SHA256).Hash
+          if ($inventoryHash -ne (Get-FileHash -LiteralPath $inventoryRepeatPath -Algorithm SHA256).Hash) {
+            throw 'Dependency inventory is not reproducible from the same inputs.'
+          }
+          Write-Output "Dependency inventory SHA256: $inventoryHash"
+
+      - name: Archive the scoped dependency inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-inventory-${{ github.sha }}
+          path: ${{ runner.temp }}/idm-dependency-inventory.json
+          if-no-files-found: error
+          retention-days: 30
