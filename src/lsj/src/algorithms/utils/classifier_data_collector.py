@@ -84,6 +84,23 @@ def log_event(logger: logging.Logger, level: str, event: str, **kwargs):
     getattr(logger, level.lower(), logger.info)(msg)
 
 
+class InvalidConfidenceError(ValueError):
+    """Explicitly invalid confidence must not become a successful record."""
+
+
+def _validated_confidence(value: Any) -> float:
+    message = "Confidence must be a finite number between 0 and 1."
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise InvalidConfidenceError(message)
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise InvalidConfidenceError(message) from None
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise InvalidConfidenceError(message)
+    return confidence
+
+
 class CollectorPersistenceError(RuntimeError):
     """A failed write may have partially succeeded; never replay it automatically."""
 
@@ -415,6 +432,9 @@ class DataStore:
         invalid = 0
         for row in rows:
             try:
+                # Validate even duplicate rows. An invalid score must stop
+                # initialization before history cleanup can rewrite evidence.
+                confidence = _validated_confidence(row.get("confidence", 1.0))
                 text = normalize_text(row.get("input") or row.get("text") or row.get("title") or "")
                 label = normalize_label(row.get("label", ""))
                 if not text or not label:
@@ -429,10 +449,14 @@ class DataStore:
                         entry_id=entry_id,
                         input=text,
                         label=label,
-                        confidence=float(row.get("confidence", 1.0)),
+                        confidence=confidence,
                         model=str(row.get("model", "")),
                         created_at=float(row.get("created_at", time.time())),
                     )
+            except InvalidConfidenceError:
+                raise InvalidConfidenceError(
+                    "Historical confidence is invalid; the original output is unchanged."
+                ) from None
             except Exception:
                 invalid += 1
 
@@ -810,6 +834,13 @@ class ClassifierDataCollector:
     """面向 classifier_train.py 的高吞吐蒸馏数据生成器。"""
 
     def __init__(self, runtime_cfg: RuntimeConfig, model_configs: List[ModelConfig]):
+        # Invalid configuration must fail before logger/client/file side effects.
+        try:
+            min_confidence = _validated_confidence(runtime_cfg.min_confidence)
+        except InvalidConfidenceError:
+            raise InvalidConfidenceError(
+                "min_confidence must be a finite number between 0 and 1."
+            ) from None
         self.cfg = runtime_cfg
         self.logger = setup_logger(runtime_cfg.log_level)
         random.seed(runtime_cfg.random_seed)
@@ -831,7 +862,7 @@ class ClassifierDataCollector:
         self.enable_semantic_dedup = bool(runtime_cfg.enable_semantic_dedup)
         self.flush_every = max(1, runtime_cfg.flush_every)
         self.enable_relabel_check = bool(runtime_cfg.enable_relabel_check)
-        self.min_confidence = max(0.0, min(1.0, float(runtime_cfg.min_confidence)))
+        self.min_confidence = min_confidence
 
         self.domains = runtime_cfg.domains
         self.page_types = runtime_cfg.page_types
@@ -1247,10 +1278,10 @@ class ClassifierDataCollector:
             return None
 
         try:
-            confidence = float(obj.get("confidence", 1.0))
-        except Exception:
-            confidence = 1.0
-        confidence = max(0.0, min(1.0, confidence))
+            confidence = _validated_confidence(obj.get("confidence", 1.0))
+        except InvalidConfidenceError:
+            log_event(self.logger, "warning", "invalid_confidence", stage="generation")
+            return None
 
         if confidence < self.min_confidence:
             log_event(self.logger, "warning", "confidence_too_low", confidence=confidence, threshold=self.min_confidence)
@@ -1285,9 +1316,10 @@ class ClassifierDataCollector:
 
         relabel = normalize_label(obj.get("label", ""))
         try:
-            confidence = float(obj.get("confidence", 1.0))
-        except Exception:
-            confidence = 1.0
+            confidence = _validated_confidence(obj.get("confidence", 1.0))
+        except InvalidConfidenceError:
+            log_event(self.logger, "warning", "invalid_confidence", stage="relabel")
+            return False
         if relabel != record.label or confidence < max(0.7, self.min_confidence):
             log_event(
                 self.logger,

@@ -177,6 +177,9 @@ def test_initialization_always_closes_the_connection(environment, monkeypatch, t
     closed = []
 
     class ObservedConnection:
+        def execute(self, *args, **kwargs):
+            return raw.execute(*args, **kwargs)
+
         def executescript(self, text):
             if failed:
                 raise sqlite3.OperationalError("Synthetic initialization failure")
@@ -206,6 +209,9 @@ def test_failed_rollback_preserves_initialization_error_and_still_closes_connect
     original = sqlite3.OperationalError("Synthetic original setup failure")
 
     class FailedConnection:
+        def execute(self, *args, **kwargs):
+            return raw.execute(*args, **kwargs)
+
         def executescript(self, _text):
             raw.execute("BEGIN IMMEDIATE")
             raw.execute("CREATE TABLE synthetic_partial (id INTEGER)")

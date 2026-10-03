@@ -1374,11 +1374,45 @@ class SentimentAnalyzer:
             logger.warning("输入 DataFrame 为空")
             return {'error': 'Empty DataFrame'}
 
+        def finite_number(value, lower, upper):
+            # Numeric strings from tabular exports remain supported; booleans
+            # and invalid/out-of-range measurements must not become scores.
+            if pd.api.types.is_bool(value):
+                return None
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) and lower <= number <= upper else None
+
+        def statistics(series, *, quartiles=False):
+            measured = series.dropna()
+            keys = {'mean': 'mean', 'std': 'std', 'min': 'min', 'max': 'max', 'median': '50%'}
+            if quartiles:
+                keys.update(q25='25%', q75='75%')
+            description = measured.describe() if not measured.empty else {}
+            result = {}
+            for key, source in keys.items():
+                value = finite_number(description.get(source), -math.inf, math.inf)
+                result[key] = round(value, 4) if value is not None else None
+            return result
+
         df = df.copy()  # 使用副本，避免修改调用方原始数据
-        df['polarity'] = pd.to_numeric(df['polarity'], errors='coerce')  # 转成数值，非法值记为 NaN
-        df['confidence'] = pd.to_numeric(df['confidence'], errors='coerce')  # 转成数值，便于统计
+        df['sentiment'] = df['sentiment'].astype(object).map(
+            lambda value: value.strip().title() if isinstance(value, str) else None)
+        df['polarity'] = df['polarity'].map(lambda value: finite_number(value, -1, 1)).astype(float)
+        valid = df['sentiment'].isin({'Positive', 'Neutral', 'Negative'}) & df['polarity'].notna()
+        if 'sentiment_valid' in df.columns:
+            valid &= df['sentiment_valid'].astype(object).map(lambda value: pd.api.types.is_bool(value) and bool(value))
+        df['sentiment'] = df['sentiment'].where(valid)
+        df['polarity'] = df['polarity'].where(valid)
+        df['confidence'] = df['confidence'].map(lambda value: finite_number(value, 0, 1)).astype(float).where(valid)
+        confidence_count = int(df['confidence'].notna().sum())
         report: Dict[str, Any] = {
             'total_records': len(df),  # 报告覆盖的总记录数
+            'valid_records': int(valid.sum()),
+            'missing_records': int((~valid).sum()),
+            'confidence_records': confidence_count,
             'analysis_date': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')  # 报告生成时间
         }
 
@@ -1389,57 +1423,58 @@ class SentimentAnalyzer:
             'percentages': sentiment_pct
         }
 
-        polarity_stats = df['polarity'].describe().to_dict()
-        report['polarity_statistics'] = {
-            'mean': round(polarity_stats.get('mean', 0) or 0, 4),
-            'std': round(polarity_stats.get('std', 0) or 0, 4),
-            'min': round(polarity_stats.get('min', 0) or 0, 4),
-            'max': round(polarity_stats.get('max', 0) or 0, 4),
-            'median': round(df['polarity'].median() if df['polarity'].notna().any() else 0, 4),
-            'q25': round(polarity_stats.get('25%', 0) or 0, 4),
-            'q75': round(polarity_stats.get('75%', 0) or 0, 4)
-        }
+        report['polarity_statistics'] = statistics(df['polarity'], quartiles=True)
 
         if 'emotions' in df.columns:
             try:
-                emotion_df = self.get_emotion_distribution(df)
+                def valid_emotions(value):
+                    if not isinstance(value, dict):
+                        return {}
+                    counts = {}
+                    for emotion, raw_count in value.items():
+                        count = finite_number(raw_count, 0, math.inf)
+                        if isinstance(emotion, str) and count is not None and count.is_integer():
+                            counts[emotion] = int(count)
+                    return counts
+
+                emotion_input = df.loc[valid, ['emotions']].copy()
+                emotion_input['emotions'] = emotion_input['emotions'].map(valid_emotions)
+                emotion_df = self.get_emotion_distribution(emotion_input)
                 report['emotion_distribution'] = emotion_df.to_dict('records') if not emotion_df.empty else None
             except Exception as e:
-                logger.warning(f"统计情绪分布出错: {e}")
+                logger.warning("统计情绪分布出错: %s", type(e).__name__)
                 report['emotion_distribution'] = None
         else:
             report['emotion_distribution'] = None
 
-        confidence_stats = df['confidence'].describe().to_dict()
-        report['confidence_statistics'] = {
-            'mean': round(confidence_stats.get('mean', 0) or 0, 4),
-            'std': round(confidence_stats.get('std', 0) or 0, 4),
-            'min': round(confidence_stats.get('min', 0) or 0, 4),
-            'max': round(confidence_stats.get('max', 0) or 0, 4),
-            'median': round(df['confidence'].median() if df['confidence'].notna().any() else 0, 4)
-        }
+        report['confidence_statistics'] = statistics(df['confidence'])
 
         if 'pos_count' in df.columns and 'neg_count' in df.columns:
-            report['word_statistics'] = {
-                'total_positive_words': int(df['pos_count'].sum()),
-                'total_negative_words': int(df['neg_count'].sum()),
-                'avg_positive_words': round(df['pos_count'].mean(), 2),
-                'avg_negative_words': round(df['neg_count'].mean(), 2)
-            }
+            word_stats = {}
+            for column, label in [('pos_count', 'positive'), ('neg_count', 'negative')]:
+                counts = df[column].map(lambda value: finite_number(value, 0, math.inf)).astype(float).where(valid).dropna()
+                counts = counts[counts.mod(1).eq(0)]
+                total = finite_number(counts.sum(), 0, math.inf) if not counts.empty else None
+                mean = finite_number(counts.mean(), 0, math.inf) if not counts.empty else None
+                word_stats[f'total_{label}_words'] = int(total) if total is not None else None
+                word_stats[f'avg_{label}_words'] = round(mean, 2) if mean is not None else None
+            report['word_statistics'] = word_stats
 
         if sentiment_dist:
             dominant = max(sentiment_dist, key=sentiment_dist.get)
         else:
             dominant = 'Unknown'
+        mean_polarity = report['polarity_statistics']['mean']
         report['overall_summary'] = {
             'dominant_sentiment': dominant,
-            'overall_polarity': 'Positive' if report['polarity_statistics']['mean'] > 0.1
-            else 'Negative' if report['polarity_statistics']['mean'] < -0.1
+            'overall_polarity': 'Unknown' if mean_polarity is None
+            else 'Positive' if mean_polarity > 0.1
+            else 'Negative' if mean_polarity < -0.1
             else 'Neutral',
-            'avg_confidence': round(report['confidence_statistics']['mean'], 4),
+            'avg_confidence': report['confidence_statistics']['mean'],
             'high_confidence_ratio': round(
-                (df['confidence'] >= 0.7).sum() / len(df) * 100, 2
-            )
+                int((df['confidence'] >= 0.7).sum()) / confidence_count * 100, 2
+            ) if confidence_count else None,
         }
 
         logger.info("情感分析报告生成完成")
