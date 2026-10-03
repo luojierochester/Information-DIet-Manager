@@ -1009,6 +1009,10 @@ class SentimentDataCollector:
         self.initial_existing_count = len(records)
         self.state.existing_count = len(records)
         self.state.deduped_existing_count = len(records)
+        # Persisted rows are the current baseline, including earlier runs' additions.
+        # A sidecar may predate or outlive the output and cannot establish row counts.
+        self.state.accepted_new_count = 0
+        self.state.label_counts = {c: 0 for c in self.categories}
 
         for r in records:
             self.id_set.add(r.entry_id)
@@ -1029,7 +1033,6 @@ class SentimentDataCollector:
 
         restored = self.progress.load()
         if restored and restored.output_path == self.cfg.output and restored.target_count == self.target_count:
-            self.state.accepted_new_count = restored.accepted_new_count
             self.state.generated_count = restored.generated_count
             self.state.duplicate_count = restored.duplicate_count
             self.state.filtered_count = restored.filtered_count
@@ -1043,9 +1046,6 @@ class SentimentDataCollector:
             self.state.event_counts.update(restored.event_counts)
             self.state.tone_counts.update(restored.tone_counts)
             self.state.contrast_pair_count = restored.contrast_pair_count
-            for k, v in restored.label_counts.items():
-                if k in self.state.label_counts:
-                    self.state.label_counts[k] = max(self.state.label_counts[k], v)
             self.state.status = "resumed"
         else:
             self.state.status = "ready"
