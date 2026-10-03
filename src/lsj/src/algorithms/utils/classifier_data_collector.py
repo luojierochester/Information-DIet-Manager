@@ -354,7 +354,8 @@ class ProgressTracker:
             log_event(self.logger, "info", "progress_loaded", progress_path=self.progress_path)
             return state
         except Exception as e:
-            log_event(self.logger, "warning", "progress_load_failed", progress_path=self.progress_path, reason=str(e))
+            log_event(self.logger, "warning", "progress_load_failed", progress_path=self.progress_path,
+                      error_type=type(e).__name__)
             return None
 
     async def save(self, state: ProgressState):
@@ -759,7 +760,7 @@ class ModelPool:
                         "model_request_retry",
                         model=name,
                         retry=retry + 1,
-                        reason=str(e),
+                        error_type=type(e).__name__,
                         backoff=round(backoff, 3),
                     )
                     await asyncio.sleep(backoff)
@@ -768,7 +769,7 @@ class ModelPool:
                     st.failed_calls += 1
                     self.breakers[name].on_failure()
                     await asyncio.sleep(0.2)
-        raise RuntimeError(f"All models failed. last_error={last_err}")
+        raise RuntimeError("All models failed.") from last_err
 
     async def close(self):
         first_error = None
@@ -902,7 +903,7 @@ class ClassifierDataCollector:
             log_event(self.logger, "info", "sbert_loaded", model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
         except Exception as e:
             self.embed_model = None
-            log_event(self.logger, "warning", "sbert_unavailable", reason=str(e))
+            log_event(self.logger, "warning", "sbert_unavailable", error_type=type(e).__name__)
 
     @staticmethod
     def _build_targets(keys: List[str], ratios: List[float], total: int) -> Dict[str, int]:
@@ -1155,7 +1156,7 @@ class ClassifierDataCollector:
                 self.embeddings = np.asarray(embs, dtype=np.float32)
                 self.embedding_texts = [r.input for r in records]
             except Exception as e:
-                log_event(self.logger, "warning", "history_embedding_failed", reason=str(e))
+                log_event(self.logger, "warning", "history_embedding_failed", error_type=type(e).__name__)
 
         restored = self.progress.load()
         if restored and restored.output_path == self.cfg.output and restored.target_count == self.target_count:
@@ -1204,12 +1205,12 @@ class ClassifierDataCollector:
             log_event(self.logger, "warning", "task_timeout", spec=spec)
             return None
         except Exception as e:
-            log_event(self.logger, "warning", "generate_failed", spec=spec, reason=str(e))
+            log_event(self.logger, "warning", "generate_failed", spec=spec, error_type=type(e).__name__)
             return None
 
         obj = safe_json_extract(raw)
         if not isinstance(obj, dict):
-            log_event(self.logger, "warning", "parse_failed", raw_preview=raw[:300])
+            log_event(self.logger, "warning", "parse_failed", response_length=len(raw))
             return None
 
         text = normalize_text(obj.get("input") or obj.get("title") or obj.get("text") or "")
@@ -1220,8 +1221,8 @@ class ClassifierDataCollector:
                 "warning",
                 "label_mismatch",
                 expected=spec["label"],
-                actual=label,
-                text_preview=text[:80],
+                received_label_length=len(label),
+                text_length=len(text),
             )
             return None
 
@@ -1253,12 +1254,13 @@ class ClassifierDataCollector:
                 timeout=self.cfg.retry.task_timeout,
             )
         except Exception as e:
-            log_event(self.logger, "warning", "relabel_failed", input_preview=record.input[:80], reason=str(e))
+            log_event(self.logger, "warning", "relabel_failed",
+                      text_length=len(record.input), error_type=type(e).__name__)
             return False
 
         obj = safe_json_extract(raw)
         if not isinstance(obj, dict):
-            log_event(self.logger, "warning", "relabel_parse_failed", raw_preview=raw[:200])
+            log_event(self.logger, "warning", "relabel_parse_failed", response_length=len(raw))
             return False
 
         relabel = normalize_label(obj.get("label", ""))
@@ -1272,10 +1274,10 @@ class ClassifierDataCollector:
                 "warning",
                 "relabel_rejected",
                 original_label=record.label,
-                relabel=relabel,
+                received_label_length=len(relabel),
                 confidence=confidence,
                 model=model_name,
-                input_preview=record.input[:80],
+                text_length=len(record.input),
             )
             return False
         return True
