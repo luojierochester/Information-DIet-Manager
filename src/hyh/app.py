@@ -1614,8 +1614,14 @@ def _run_full_analysis_snapshot(*, force, from_ts, to_ts, limit_rows):
                 "result": payload,
             }
         except Exception:
-            conn.execute("ROLLBACK TO legacy_analysis_result")
-            conn.execute("RELEASE legacy_analysis_result")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK TO legacy_analysis_result")
+                conn.execute("RELEASE legacy_analysis_result")
+            else:
+                # A whole-transaction rollback removes the savepoint and
+                # releases the writer; another change may now own this data.
+                conn.execute("BEGIN IMMEDIATE")
+                _require_analysis_revision(conn, revision, job_id=job_id)
             return _failed_analysis_response(
                 conn, job_id, started_at, input_count, 500,
                 "Legacy analysis failed; no valid result was produced.",
