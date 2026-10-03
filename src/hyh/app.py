@@ -1037,10 +1037,10 @@ def _import_items_sync(file: UploadFile) -> IngestAck:
             raw_items = _load_items_from_json(text)
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type.")
-    except (ValueError, json.JSONDecodeError) as exc:
+    except (ValueError, csv.Error, RecursionError):
         raise HTTPException(
-            status_code=400, detail=f"Invalid file contents: {exc}"
-        ) from exc
+            status_code=400, detail="Invalid file contents."
+        ) from None
     items: List[IngestItem] = []
     for raw in raw_items:
         try:
