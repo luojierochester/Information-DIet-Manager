@@ -1,5 +1,6 @@
 """Backup delivery retains its restore contract while sharing download limits."""
 import asyncio
+import contextlib
 import hashlib
 import json
 import threading
@@ -8,7 +9,10 @@ import pytest
 from starlette.requests import ClientDisconnect
 
 from src.hyh import app as api, data_management as management, db, export_io
-from src.hyh.tests.test_export_delivery import COLLECTOR, BASE_TS, Delivery, collect, finish, request
+from src.hyh.tests.test_export_delivery import (
+    COLLECTOR, BASE_TS, Delivery, collect, finish, request,
+    wait_for_delivery_ready, preparation_budgets,
+)
 
 
 @pytest.fixture
@@ -74,7 +78,7 @@ def test_slow_backup_releases_data_gate_and_keeps_original_snapshot_during_write
             slow = Delivery(hold=True)
             task = asyncio.create_task(request("GET", "/data/backup", delivery=slow))
             try:
-                await asyncio.wait_for(slow.entered.wait(), 5)
+                await wait_for_delivery_ready(task, slow, "/data/backup")
                 assert slow.status == 200 and not api.app.state.operation_lock.locked()
                 await collect(1)
                 newer = await request("GET", "/data/backup")
@@ -107,7 +111,7 @@ def test_backups_and_exports_share_two_slots_without_blocking_collection(backup_
             try:
                 for path, delivery in zip(paths, deliveries):
                     tasks.append(asyncio.create_task(request("GET", path, delivery=delivery)))
-                    await asyncio.wait_for(delivery.entered.wait(), 5)
+                    await wait_for_delivery_ready(tasks[-1], delivery, path)
                     assert delivery.status == 200
                 stream_count = len(backup_streams)
                 for path in ("/data/backup", "/export/lsj", "/export/lsj/training"):
@@ -128,6 +132,59 @@ def test_backups_and_exports_share_two_slots_without_blocking_collection(backup_
     asyncio.run(scenario())
 
 
+def test_successful_mixed_export_preparation_can_exceed_old_five_second_wait(backup_streams, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    create_file = export_io._temporary_file
+    files = []
+
+    def held_file():
+        entered.set()
+        assert release.wait(export_io.PREPARE_SECONDS + 5), "Synthetic preparation was not released"
+        # Still create the real temporary file and apply real Windows ACLs.
+        stream = create_file()
+        files.append(stream)
+        return stream
+
+    monkeypatch.setattr(export_io, "_temporary_file", held_file)
+
+    async def scenario():
+        async with api.app.router.lifespan_context(api.app):
+            await collect(0)
+            first, second = Delivery(hold=True), Delivery(hold=True)
+            backup = asyncio.create_task(request("GET", "/data/backup", delivery=first))
+            export = ready = None
+            try:
+                await wait_for_delivery_ready(backup, first, "/data/backup")
+                export = asyncio.create_task(request("GET", "/export/lsj", delivery=second))
+                assert await asyncio.to_thread(entered.wait, export_io.PREPARE_SECONDS + 5)
+                ready = asyncio.create_task(wait_for_delivery_ready(export, second, "/export/lsj"))
+                # Prove that crossing the old cutoff does not fail a request
+                # still within its real preparation budget. This timer releases
+                # a controlled gate; there is no unconditional readiness sleep.
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(ready), 5)
+                assert not ready.done() and not export.done() and second.status is None
+                release.set()
+                await ready
+                assert second.status == 200 and not api.app.state.operation_lock.locked()
+                assert api.app.state.export_slots._value == 0
+                for path in ("/data/backup", "/export/lsj", "/export/lsj/training"):
+                    assert (await request("GET", path)).status == 503
+                await collect(1)
+            finally:
+                release.set()
+                await finish(backup, first)
+                if export is not None:
+                    await finish(export, second)
+                if ready is not None:
+                    ready.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, AssertionError):
+                        await ready
+            assert files and all(stream.closed for stream in files)
+            assert_released(backup_streams)
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("failure", ["send_start", "send_body", "disconnect23", "cancel", "timeout"])
 def test_backup_delivery_failure_closes_buffer_and_returns_all_slots(backup_streams, monkeypatch, failure):
     if failure == "timeout":
@@ -145,7 +202,7 @@ def test_backup_delivery_failure_closes_buffer_and_returns_all_slots(backup_stre
                 task = asyncio.create_task(request("GET", "/data/backup", delivery=slow,
                     asgi_spec="2.3" if failure == "disconnect23" else "2.4", disconnect=disconnected))
                 try:
-                    await asyncio.wait_for(slow.entered.wait(), 5)
+                    await wait_for_delivery_ready(task, slow, "/data/backup")
                     if failure == "disconnect23":
                         disconnected.set()
                         await asyncio.wait_for(task, 5)
@@ -187,7 +244,10 @@ def test_backup_preparation_cancel_waits_for_worker_and_closes_unpublished_buffe
             delivery = Delivery()
             task = asyncio.create_task(request("GET", "/data/backup", delivery=delivery))
             try:
-                assert await asyncio.to_thread(entered.wait, 5)
+                _, wait_budget = preparation_budgets("/data/backup")
+                assert await asyncio.to_thread(entered.wait, wait_budget), (
+                    f"Backup worker did not reach response construction: path=/data/backup, status={delivery.status}, "
+                    f"request_done={task.done()}, wait_budget={wait_budget}s")
                 task.cancel()
                 await asyncio.sleep(0)
                 if repeat_cancel:

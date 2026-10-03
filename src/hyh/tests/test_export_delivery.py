@@ -17,6 +17,7 @@ from src.hyh import app as api, db
 ADMIN = "a" * 43
 COLLECTOR = "c" * 43
 BASE_TS = 1790208000000
+READINESS_SCHEDULING_MARGIN_SECONDS = 5
 
 
 @pytest.fixture
@@ -111,6 +112,50 @@ async def collect(index):
     assert response.status == 200 and response.json()["inserted"] == 1
 
 
+def preparation_budgets(path):
+    """Return product preparation time and its test observation allowance."""
+    from src.hyh import data_management, export_io
+
+    prepare_seconds = (data_management.BACKUP_PREPARE_SECONDS
+        if urlsplit(path).path == "/data/backup" else export_io.PREPARE_SECONDS)
+    return prepare_seconds, prepare_seconds + READINESS_SCHEDULING_MARGIN_SECONDS
+
+
+async def wait_for_delivery_ready(task, delivery, path):
+    """Wait for HTTP 200 body readiness or fail when the request ends first.
+
+    Preparation has its own product deadline. The extra margin covers admission
+    and CI scheduling, not permission for preparation to exceed its real budget.
+    Only the event waiter is cancelled here; callers still own request cleanup.
+    """
+    prepare_seconds, timeout = preparation_budgets(path)
+    ready = asyncio.create_task(delivery.entered.wait())
+    try:
+        await asyncio.wait({task, ready}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        state = (f"path={path}, status={delivery.status}, body_event={delivery.entered.is_set()}, "
+                 f"request_done={task.done()}, prepare_budget={prepare_seconds}s, wait_budget={timeout}s")
+        if delivery.status is not None and delivery.status != 200:
+            raise AssertionError(f"Delivery returned non-success HTTP status: {state}")
+        if delivery.entered.is_set() and delivery.status == 200:
+            # Readiness already happened, even if an intentional short download
+            # deadline fired before the event loop resumed this observer. The
+            # caller still verifies the request's final result/exception.
+            return
+        if task.done():
+            if task.cancelled():
+                raise AssertionError(f"Delivery request cancelled before readiness: {state}")
+            error = task.exception()
+            if error is not None:
+                raise AssertionError(f"Delivery request failed ({type(error).__name__}): {state}") from error
+        if task.done():
+            raise AssertionError(f"Delivery request ended before successful body readiness: {state}")
+        raise AssertionError(f"Delivery readiness timed out: {state}")
+    finally:
+        ready.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ready
+
+
 async def finish(task, delivery):
     delivery.release.set()
     if not task.done():
@@ -130,6 +175,72 @@ def assert_released(files):
     assert api.app.state.request_slots._value == 4
 
 
+@pytest.mark.parametrize("ending", ["error", "cancelled", "empty_success"])
+def test_readiness_reports_request_ending_before_successful_body(ending):
+    async def scenario():
+        delivery = Delivery()
+
+        async def end_request():
+            if ending == "error":
+                raise RuntimeError("Synthetic request failure")
+            if ending == "cancelled":
+                raise asyncio.CancelledError()
+            delivery.status = 200
+
+        task = asyncio.create_task(end_request())
+        try:
+            with pytest.raises(AssertionError, match="path=/export/lsj.*request_done=True"):
+                await asyncio.wait_for(wait_for_delivery_ready(task, delivery, "/export/lsj"), 1)
+        finally:
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await task
+    asyncio.run(scenario())
+
+
+def test_readiness_rejects_real_preparation_error_without_waiting_for_success(export_files, monkeypatch):
+    from src.hyh import export_io
+
+    monkeypatch.setattr(export_io, "PREPARE_SECONDS", 0)
+    # This case isolates the readiness helper's response-error branch. Real
+    # Windows ACL creation is exercised by the controlled slow-preparation case.
+    stream = io.BytesIO()
+    monkeypatch.setattr(export_io, "_temporary_file", lambda: stream)
+
+    async def scenario():
+        async with api.app.router.lifespan_context(api.app):
+            delivery = Delivery(hold=True)
+            task = asyncio.create_task(request("GET", "/export/lsj", delivery=delivery))
+            try:
+                with pytest.raises(AssertionError, match="non-success HTTP status:.*status=503"):
+                    await asyncio.wait_for(wait_for_delivery_ready(task, delivery, "/export/lsj"), 1)
+                assert stream.closed
+            finally:
+                await finish(task, delivery)
+            assert not api.app.state.operation_lock.locked()
+            assert api.app.state.export_slots._value == 2
+            assert api.app.state.request_slots._value == 4
+    asyncio.run(scenario())
+
+
+def test_readiness_timeout_does_not_cancel_request_or_hide_state(monkeypatch):
+    from src.hyh import export_io
+
+    monkeypatch.setattr(export_io, "PREPARE_SECONDS", 0)
+    monkeypatch.setitem(globals(), "READINESS_SCHEDULING_MARGIN_SECONDS", 0.01)
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.Event().wait())
+        try:
+            with pytest.raises(AssertionError, match="readiness timed out:.*status=None.*request_done=False"):
+                await wait_for_delivery_ready(task, Delivery(), "/export/lsj")
+            assert not task.done()
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("endpoint", ["/export/lsj", "/export/lsj/training"])
 def test_slow_export_allows_collection_delete_restore_and_keeps_its_prepared_snapshot(export_files, endpoint):
     async def scenario():
@@ -138,7 +249,7 @@ def test_slow_export_allows_collection_delete_restore_and_keeps_its_prepared_sna
             slow = Delivery(hold=True)
             download = asyncio.create_task(request("GET", endpoint, delivery=slow))
             try:
-                await asyncio.wait_for(slow.entered.wait(), 5)
+                await wait_for_delivery_ready(download, slow, endpoint)
                 assert slow.status == 200 and not api.app.state.operation_lock.locked()
                 await collect(1)
                 backup = await request("GET", "/data/backup")
@@ -169,7 +280,7 @@ def test_two_slow_downloads_reject_third_without_building_more_files_then_recove
             try:
                 for endpoint, delivery in zip(("/export/lsj?fmt=jsonl", "/export/lsj/training?fmt=csv"), deliveries):
                     tasks.append(asyncio.create_task(request("GET", endpoint, delivery=delivery)))
-                    await asyncio.wait_for(delivery.entered.wait(), 5)
+                    await wait_for_delivery_ready(tasks[-1], delivery, endpoint)
                     assert delivery.status == 200
                 file_count = len(export_files)
                 rejected = await request("GET", "/export/lsj")
@@ -210,7 +321,7 @@ def test_cancelled_download_closes_files_and_releases_admission(export_files):
             slow = Delivery(hold=True)
             task = asyncio.create_task(request("GET", "/export/lsj?fmt=csv", delivery=slow))
             try:
-                await asyncio.wait_for(slow.entered.wait(), 5)
+                await wait_for_delivery_ready(task, slow, "/export/lsj?fmt=csv")
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -233,7 +344,7 @@ def test_download_deadline_closes_files_and_releases_admission(export_files, mon
             slow = Delivery(hold=True)
             task = asyncio.create_task(request("GET", "/export/lsj?fmt=jsonl", delivery=slow))
             try:
-                await asyncio.wait_for(slow.entered.wait(), 5)
+                await wait_for_delivery_ready(task, slow, "/export/lsj?fmt=jsonl")
                 with pytest.raises(TimeoutError):
                     await asyncio.wait_for(asyncio.shield(task), 2)
                 # Shielding means the outer test timeout cannot supply production cleanup.
@@ -281,7 +392,10 @@ def test_preparation_cancel_waits_for_worker_and_closes_result_without_sending(
             delivery = Delivery()
             task = asyncio.create_task(request("GET", "/export/lsj", delivery=delivery))
             try:
-                assert await asyncio.to_thread(entered.wait, 5)
+                _, wait_budget = preparation_budgets("/export/lsj")
+                assert await asyncio.to_thread(entered.wait, wait_budget), (
+                    f"Export worker did not reach encoding: path=/export/lsj, status={delivery.status}, "
+                    f"request_done={task.done()}, wait_budget={wait_budget}s")
                 task.cancel()
                 await asyncio.sleep(0)  # Let the owner enter its cancellation cleanup.
                 if repeat_cancel:
@@ -387,7 +501,7 @@ def test_asgi23_disconnect_event_closes_files_and_releases_admission(export_file
             task = asyncio.create_task(request("GET", endpoint, delivery=slow,
                                                asgi_spec="2.3", disconnect=disconnected))
             try:
-                await asyncio.wait_for(slow.entered.wait(), 5)
+                await wait_for_delivery_ready(task, slow, endpoint)
                 disconnected.set()
                 # Uvicorn's ASGI 2.3 receive-disconnect branch cancels the
                 # streaming task internally and returns without an exception.
