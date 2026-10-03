@@ -347,15 +347,28 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__":
+def cli_main() -> int:
+    """Keep process failures private and consistent across command-line aliases."""
     try:
         main()
-    except KeyboardInterrupt:
-        print("Interrupted by user.")
+    except KeyboardInterrupt as exc:
+        error_payload = {
+            "success": False,
+            "error": "Analysis was interrupted. Run the command again when ready.",
+            "error_type": type(exc).__name__,
+        }
+        print(json.dumps(error_payload, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 130
     except Exception as exc:
         error_payload = {
             "success": False,
-            "error": str(exc),
+            "error": "Analysis failed. Check the input file, options, and model setup, then retry.",
+            "error_type": type(exc).__name__,
         }
-        print(json.dumps(error_payload, ensure_ascii=False, indent=2))
-        sys.exit(1)
+        print(json.dumps(error_payload, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(cli_main())
