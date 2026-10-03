@@ -39,7 +39,7 @@ class DependencyInventoryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="idm-inventory-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         for path in inventory.INPUT_PATHS:
             (self.root / path).parent.mkdir(parents=True, exist_ok=True)
         self.put(inventory.PYTHON_LOCKS["runtime"], lock({"Alpha_Pkg": "1.2.3"}, (HASH_B, HASH_A)))
