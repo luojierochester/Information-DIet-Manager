@@ -11,6 +11,7 @@
     - 支持 JSON / Markdown / HTML 报告导出。
 """
 import json
+from html import escape
 from pathlib import Path
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import List, Dict, Optional, Any, Tuple
@@ -2465,9 +2466,9 @@ class InformationQualityEvaluator:
                 "<body>\n"
                 "<h1>信息摄取质量评估报告</h1>\n"
                 "<h2>摘要</h2>\n"
-                f"<pre>{summary}</pre>\n"
+                f"<pre>{escape(summary)}</pre>\n"
                 "<h2>完整数据（JSON）</h2>\n"
-                f"<pre>{json.dumps(data, ensure_ascii=False, indent=2)}</pre>\n"
+                f"<pre>{escape(json.dumps(data, ensure_ascii=False, indent=2))}</pre>\n"
                 "</body>\n"
                 "</html>\n"
             )
