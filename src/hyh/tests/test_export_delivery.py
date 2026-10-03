@@ -18,6 +18,30 @@ ADMIN = "a" * 43
 COLLECTOR = "c" * 43
 BASE_TS = 1790208000000
 READINESS_SCHEDULING_MARGIN_SECONDS = 5
+SAFE_DELIVERY_FAILURES = {
+    "Request capacity reached; retry later": "request_capacity",
+    "Export capacity reached; retry later": "export_capacity",
+    "Service busy; retry later": "operation_busy",
+    "Service is shutting down; retry later": "service_shutdown",
+    "Export preparation timed out; select a smaller window": "export_preparation_timeout",
+    "Export database unavailable; retry later": "export_database_unavailable",
+    "Export temporary storage unavailable": "export_storage_unavailable",
+    "Backup preparation timed out; retry later": "backup_preparation_timeout",
+    "Backup database unavailable; retry later": "backup_database_unavailable",
+}
+
+
+def safe_delivery_failure(body):
+    # Capture only an exact, fixed product diagnostic before a synthetic slow
+    # consumer blocks. Never include arbitrary response bytes in CI assertions.
+    if len(body) > 4096:
+        return "unclassified"
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError, RecursionError):
+        return "unclassified"
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    return SAFE_DELIVERY_FAILURES.get(detail, "unclassified") if isinstance(detail, str) else "unclassified"
 
 
 @pytest.fixture
@@ -48,6 +72,7 @@ class Delivery:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.status = None
+        self.failure_kind = None
         self.headers = {}
         self.body = bytearray()
         self.chunks = []
@@ -60,6 +85,8 @@ class Delivery:
                 raise OSError("Synthetic response-start disconnect")
         elif message["type"] == "http.response.body":
             if message.get("body"):
+                if self.status != 200 and self.failure_kind is None:
+                    self.failure_kind = safe_delivery_failure(message["body"])
                 self.entered.set()
                 if self.fail_at == "body":
                     raise OSError("Synthetic response-body disconnect")
@@ -133,7 +160,8 @@ async def wait_for_delivery_ready(task, delivery, path):
     try:
         await asyncio.wait({task, ready}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         state = (f"path={path}, status={delivery.status}, body_event={delivery.entered.is_set()}, "
-                 f"request_done={task.done()}, prepare_budget={prepare_seconds}s, wait_budget={timeout}s")
+                 f"request_done={task.done()}, prepare_budget={prepare_seconds}s, wait_budget={timeout}s, "
+                 f"failure_kind={delivery.failure_kind}")
         if delivery.status is not None and delivery.status != 200:
             raise AssertionError(f"Delivery returned non-success HTTP status: {state}")
         if delivery.entered.is_set() and delivery.status == 200:
@@ -175,6 +203,80 @@ def assert_released(files):
     assert api.app.state.request_slots._value == 4
 
 
+@pytest.mark.parametrize("detail,kind", list(SAFE_DELIVERY_FAILURES.items()))
+def test_readiness_classifies_fixed_error_before_slow_body_is_released(detail, kind):
+    async def scenario():
+        delivery = Delivery(hold=True)
+
+        async def failed_request():
+            await delivery.send({"type": "http.response.start", "status": 503, "headers": []})
+            await delivery.send({"type": "http.response.body", "body": json.dumps({"detail": detail}).encode()})
+
+        task = asyncio.create_task(failed_request())
+        try:
+            with pytest.raises(AssertionError, match="failure_kind=" + kind):
+                await wait_for_delivery_ready(task, delivery, "/export/lsj")
+            assert delivery.entered.is_set() and not task.done() and not delivery.body
+            assert delivery.failure_kind == kind
+        finally:
+            await finish(task, delivery)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("body", [
+    b'{"detail":"SYNTHETIC_PRIVATE_TOKEN"}',
+    b'{"detail":{"private":"SYNTHETIC_PRIVATE_TOKEN"}}',
+    b'["SYNTHETIC_PRIVATE_TOKEN"]',
+    b'SYNTHETIC_PRIVATE_TOKEN invalid JSON',
+    b'{"detail":"Export preparation timed out; select a smaller window SYNTHETIC_PRIVATE_TOKEN"}',
+    b'{"detail":"SYNTHETIC_PRIVATE_TOKEN' + b'x' * 4096 + b'"}',
+    b'[' * 1500 + b'"SYNTHETIC_PRIVATE_TOKEN"' + b']' * 1500,
+], ids=["text", "object", "array", "malformed", "known-prefix-private-suffix", "oversized", "deeply-nested"])
+def test_readiness_never_reflects_unknown_error_body(body):
+    async def scenario():
+        delivery = Delivery(hold=True)
+
+        async def failed_request():
+            await delivery.send({"type": "http.response.start", "status": 503, "headers": []})
+            await delivery.send({"type": "http.response.body", "body": body})
+
+        task = asyncio.create_task(failed_request())
+        try:
+            with pytest.raises(AssertionError, match="failure_kind=unclassified") as raised:
+                await wait_for_delivery_ready(task, delivery, "/export/lsj")
+            assert "SYNTHETIC_PRIVATE_TOKEN" not in str(raised.value)
+            assert not delivery.body and not task.done()
+        finally:
+            await finish(task, delivery)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("resource,capacity,kind", [("export_slots", 2, "export_capacity"),
+                                                    ("request_slots", 4, "request_capacity")])
+def test_readiness_distinguishes_real_admission_rejection(export_files, resource, capacity, kind):
+    async def scenario():
+        async with api.app.router.lifespan_context(api.app):
+            slots = getattr(api.app.state, resource)
+            for _ in range(capacity):
+                await slots.acquire()
+            delivery = Delivery(hold=True)
+            task = asyncio.create_task(request("GET", "/export/lsj", delivery=delivery))
+            try:
+                with pytest.raises(AssertionError, match="failure_kind=" + kind):
+                    await wait_for_delivery_ready(task, delivery, "/export/lsj")
+                assert delivery.status == 503 and not task.done() and not delivery.body
+                assert export_files == [] and not api.app.state.operation_lock.locked()
+            finally:
+                await finish(task, delivery)
+                for _ in range(capacity):
+                    slots.release()
+            assert api.app.state.export_slots._value == 2 and api.app.state.request_slots._value == 4
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("ending", ["error", "cancelled", "empty_success"])
 def test_readiness_reports_request_ending_before_successful_body(ending):
     async def scenario():
@@ -213,6 +315,7 @@ def test_readiness_rejects_real_preparation_error_without_waiting_for_success(ex
             try:
                 with pytest.raises(AssertionError, match="non-success HTTP status:.*status=503"):
                     await asyncio.wait_for(wait_for_delivery_ready(task, delivery, "/export/lsj"), 1)
+                assert delivery.failure_kind == "export_preparation_timeout"
                 assert stream.closed
             finally:
                 await finish(task, delivery)
