@@ -204,6 +204,65 @@ async function run() {
   await until(async () => !(await page.getByTestId('backup').isDisabled()), 'backup complete');
   await page.screenshot({ path: path.join(artifacts, 'connected.png'), fullPage: true });
   pass('authenticated backup downloads two page records without capability keys');
+
+  // Change only a disposable fixture's URL/hash; compare every table before cleanup.
+  const conflictState = path.join(temp, 'backup-conflict-state.json');
+  const conflictFixture = [
+    'import hashlib, json, sqlite3, sys',
+    'from pathlib import Path',
+    'database, state_path, action = sys.argv[1:]',
+    'state_file = Path(state_path)',
+    'def snapshot(conn):',
+    '    return hashlib.sha256("\\n".join(conn.iterdump()).encode("utf-8")).hexdigest()',
+    'with sqlite3.connect(database) as conn:',
+    '    if action == "seed":',
+    '        row = conn.execute("SELECT id, url, url_hash FROM items WHERE url = ?", ("https://example.invalid/1",)).fetchone()',
+    '        assert row is not None',
+    '        revision = conn.execute("SELECT revision FROM items_revision WHERE singleton = 1").fetchone()[0]',
+    '        state = {"row": row, "revision": revision, "before": snapshot(conn)}',
+    '        conn.execute("UPDATE items SET url = ?, url_hash = NULL WHERE id = ?", ("https://EXAMPLE.invalid:443/0#backup-409-fixture", row[0]))',
+    '        conn.commit()',
+    '        state["conflict"] = snapshot(conn)',
+    '        state_file.write_text(json.dumps(state), encoding="utf-8")',
+    '    else:',
+    '        state = json.loads(state_file.read_text(encoding="utf-8"))',
+    '        if action == "verify":',
+    '            assert snapshot(conn) == state["conflict"], "Rejected backup changed the database"',
+    '        elif action == "cleanup":',
+    '            row = state["row"]',
+    '            assert conn.execute("UPDATE items SET url = ?, url_hash = ? WHERE id = ?", (row[1], row[2], row[0])).rowcount == 1',
+    '            conn.execute("UPDATE items_revision SET revision = ? WHERE singleton = 1 AND revision = ?", (state["revision"], state["revision"] + 2))',
+    '            conn.commit()',
+    '            assert snapshot(conn) == state["before"], "Fixture cleanup did not restore the original database"',
+    '        else:',
+    '            raise AssertionError("Unknown fixture action")',
+  ].join('\n');
+  const runConflictFixture = action => command(['-c', conflictFixture, database, conflictState, action],
+    { cwd: root, env: { ...process.env, PYTHONUTF8: '1' } }, process.env.IDM_TEST_PYTHON || 'python');
+  let rejectedBackupDownloads = 0;
+  const onRejectedBackupDownload = () => { rejectedBackupDownloads += 1; };
+  await runConflictFixture('seed');
+  page.on('download', onRejectedBackupDownload);
+  try {
+    const rejectedResponse = page.waitForResponse(response => response.url() === api + '/data/backup'
+      && response.request().method() === 'GET');
+    await page.getByTestId('backup').click();
+    const response = await rejectedResponse;
+    assert.equal(response.status(), 409);
+    assert.equal(await response.finished(), null);
+    await until(async () => !(await page.getByTestId('backup').isDisabled())
+      && !(await page.getByTestId('refresh-records').isDisabled()), 'conflicting backup rejected and maintenance released');
+    assert.equal(await page.getByTestId('data-result').textContent(), '操作结果未确认，请检查服务、备份文件并刷新核对数据；不要连续重复提交。');
+    assert.equal(rejectedBackupDownloads, 0, 'Rejected backup must not initiate a download');
+    await runConflictFixture('verify');
+  } finally {
+    page.off('download', onRejectedBackupDownload);
+    await runConflictFixture('cleanup');
+  }
+  await page.getByTestId('refresh-records').click();
+  await until(async () => await savedTotal.textContent() === '2'
+    && !(await page.getByTestId('refresh-records').isDisabled()), 'original records refreshed after fixture cleanup');
+  pass('real duplicate-URL backup returns 409, shows failure without downloading, preserves every database table, and releases maintenance');
   await hideSettings();
   const originalBodyOverflow = await page.evaluate(() => document.body.style.overflow);
   await page.getByTestId('records-toggle').click();

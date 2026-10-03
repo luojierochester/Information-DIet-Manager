@@ -16,6 +16,7 @@ from . import export_io
 from .db import get_conn
 from .models import IngestItem
 from .owned_work import run_owned_sync
+from .utils import normalize_url, sha256_hex
 
 MAX_BACKUP_RECORDS = 10000
 MAX_BACKUP_BYTES = 20 * 1024 * 1024
@@ -97,6 +98,7 @@ def _read_backup_items(conn, budget):
     size_sql = " + ".join(f"COALESCE(length(CAST({field} AS BLOB)), 0)" for field in FIELDS)
     with closing(budget.execute(conn, f"SELECT id, ({size_sql}) AS byte_size FROM items ORDER BY id")) as cursor:
         items, size = [], 2
+        seen_url_hashes = set()
         while True:
             budget.set_busy_timeout(conn)
             sized = cursor.fetchone()
@@ -116,6 +118,13 @@ def _read_backup_items(conn, budget):
                 budget.check_time()
             record = IngestItem.model_validate(record).model_dump(mode="json")
             budget.check_time()
+            # Restoration hashes the validated URL, not a possibly absent or
+            # stale legacy hash. A successful backup must be restorable.
+            url_hash = sha256_hex(normalize_url(record["url"]))
+            budget.check_time()
+            if url_hash in seen_url_hashes:
+                raise HTTPException(409, "Stored records contain duplicate normalized page URLs; backup cannot be restored")
+            seen_url_hashes.add(url_hash)
             size += len(canonical_items(record)) + int(bool(items))
             budget.check_time()
             if size > MAX_BACKUP_BYTES:
