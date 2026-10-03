@@ -215,7 +215,7 @@ def install_data_routes(app, insert_items):
             with get_conn() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 clear_all(conn)
-                inserted, duplicates = insert_items(backup.items, connection=conn)
+                inserted, duplicates = insert_items(backup.items, connection=conn, preserve_text=True)
                 if duplicates:
                     raise HTTPException(422, "Backup contains duplicate normalized page URLs; nothing changed")
             return {"restored": inserted, "analysis_cleared": True}

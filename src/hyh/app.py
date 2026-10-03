@@ -11,7 +11,7 @@ import re
 import struct
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -104,7 +104,7 @@ def _parse_tags(value: Any) -> Optional[List[str]]:
                 pass
         parts = [p.strip() for p in stripped.split("|") if p.strip()]
         return parts or None
-    return None
+    raise ValueError("tags must be a list, a supported text representation, or null")
 
 
 def _parse_meta(value: Any) -> Optional[Dict[str, Any]]:
@@ -119,10 +119,10 @@ def _parse_meta(value: Any) -> Optional[Dict[str, Any]]:
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
-            return None
-        if isinstance(parsed, dict):
+            raise ValueError("meta must contain a JSON object or null") from None
+        if parsed is None or isinstance(parsed, dict):
             return parsed
-    return None
+    raise ValueError("meta must be an object or null")
 
 
 def _coerce_int(value: Any, field: str) -> int:
@@ -165,12 +165,16 @@ def _prepare_item(raw: Dict[str, Any]) -> IngestItem:
     return IngestItem(**data)
 
 
-def _row_from_item(item: IngestItem) -> Dict[str, Any]:
+def _row_from_item(item: IngestItem, *, preserve_text: bool = False) -> Dict[str, Any]:
     title = (item.title or "").strip()
-    text = _clean_optional_str(item.text)
-    if text is None:
-        text = title
-    text = _truncate_text(text)
+    # Versioned backups already passed their schema/checksum checks. Preserve
+    # their text exactly; new collection/import retains its normal text policy.
+    text = item.text
+    if not preserve_text:
+        text = _clean_optional_str(text)
+        if text is None:
+            text = title
+        text = _truncate_text(text)
     url_norm = normalize_url(str(item.url))
     content_norm = normalize_text(title, text)
     return {
@@ -697,7 +701,7 @@ def _get_job_row(conn: Any, job_id: int) -> Optional[Dict[str, Any]]:
     return data
 
 
-def insert_items(items: Iterable[IngestItem], *, connection=None) -> Tuple[int, int]:
+def insert_items(items: Iterable[IngestItem], *, connection=None, preserve_text: bool = False) -> Tuple[int, int]:
     inserted = 0
     duplicates = 0
     sql = """
@@ -711,7 +715,7 @@ def insert_items(items: Iterable[IngestItem], *, connection=None) -> Tuple[int, 
     """
     with (get_conn() if connection is None else nullcontext(connection)) as conn:
         for item in items:
-            row = _row_from_item(item)
+            row = _row_from_item(item, preserve_text=True) if preserve_text else _row_from_item(item)
             cur = conn.execute(sql, row)
             if cur.rowcount == 1:
                 inserted += 1
@@ -800,6 +804,152 @@ def _load_analysis_cache(value: Any) -> Dict[str, Any]:
         return payload if isinstance(payload, dict) else {}
     except InvalidStoredAnalysis:
         return {}
+
+
+def _cache_count(value: Any, maximum: int, minimum: int = 0) -> bool:
+    return type(value) is int and minimum <= value <= maximum
+
+
+def _valid_visualization_series(value: Any, *, maximum: int, first_date: str, last_date: str) -> bool:
+    """Check current daily chart fields, preserving independent missing metrics."""
+    if not isinstance(value, list):
+        return False
+    previous_date = ""
+    metric_counts = {
+        "avg_polarity": ("polarity_count", -1),
+        "avg_similarity": ("comparison_count", 0),
+        "repeat_ratio": ("comparison_count", 0),
+        "positive_ratio": ("sentiment_count", 0),
+        "neutral_ratio": ("sentiment_count", 0),
+        "negative_ratio": ("sentiment_count", 0),
+    }
+    for row in value:
+        if not isinstance(row, dict) or not _cache_count(row.get("count"), maximum, 1):
+            return False
+        date = row.get("date")
+        if not isinstance(date, str) or len(date) != 10 or not first_date <= date <= last_date:
+            return False
+        try:
+            if datetime.fromisoformat(date).date().isoformat() != date or date <= previous_date:
+                return False
+        except ValueError:
+            return False
+        previous_date = date
+        if any(not _cache_count(row.get(key), row["count"])
+               for key in ("comparison_count", "sentiment_count", "polarity_count")):
+            return False
+        if row["polarity_count"] > row["sentiment_count"]:
+            return False
+        for key, (count_key, lower) in metric_counts.items():
+            if key not in row:
+                return False
+            if row[count_key] == 0:
+                if row[key] is not None:
+                    return False
+            elif finite_metric(row[key], lower, 1) is None:
+                return False
+        if row["sentiment_count"] and not math.isclose(
+            sum(row[f"{label}_ratio"] for label in ("positive", "neutral", "negative")),
+            1.0, abs_tol=1e-5,
+        ):
+            return False
+    return sum(row["count"] for row in value) <= maximum
+
+
+def _valid_visualization_cache(
+    payload: Dict[str, Any], *, from_ts: int, to_ts: int, limit_rows: int,
+    input_count: int, available_count: int,
+) -> bool:
+    """Only reuse structurally complete schema-v3 chart results for this snapshot.
+
+    This is a cache boundary, not a historical migration or model-quality check.
+    Invalid rows remain in history and the existing analysis path recomputes.
+    """
+    if (payload.get("analysis_status") != "ready" or payload.get("pipeline_warning")
+            or input_count < MIN_VIS_RECORDS or payload.get("date_timezone") != "UTC"
+            or type(payload.get("minimum_records")) is not int
+            or payload["minimum_records"] != MIN_VIS_RECORDS
+            or not _cache_count(payload.get("generated_at"), MAX_INGEST_TS)
+            or payload.get("category_aliases") != CATEGORY_ALIAS_MAP):
+        return False
+    window = payload.get("window")
+    expected = {"from_ts": from_ts, "to_ts": to_ts, "limit_rows": limit_rows,
+                "input_count": input_count, "processed_count": input_count,
+                "available_count": available_count}
+    if not isinstance(window, dict) or any(type(window.get(key)) is not int or window[key] != value
+                                          for key, value in expected.items()):
+        return False
+    if window.get("truncated") is not (available_count > input_count):
+        return False
+    coverage = payload.get("coverage")
+    coverage_keys = ("record_count", "timestamp_count", "category_count", "comparison_count", "sentiment_count")
+    if not isinstance(coverage, dict) or any(not _cache_count(coverage.get(key), input_count)
+                                            for key in coverage_keys):
+        return False
+    if coverage["record_count"] != input_count or coverage["comparison_count"] > input_count - 1:
+        return False
+    counts, categories, charts = payload.get("category_counts"), payload.get("categories"), payload.get("global")
+    if not all(isinstance(value, dict) for value in (counts, categories, charts)):
+        return False
+    if (set(counts) - set(CATEGORY_ALIAS_MAP) or set(categories) != set(counts)
+            or any(not _cache_count(count, input_count, 1) for count in counts.values())
+            or sum(counts.values()) != coverage["category_count"]):
+        return False
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    first_date = (epoch + timedelta(milliseconds=from_ts)).date().isoformat()
+    last_date = (epoch + timedelta(milliseconds=to_ts)).date().isoformat()
+    series = charts.get("time_series")
+    if not _valid_visualization_series(series, maximum=input_count, first_date=first_date, last_date=last_date):
+        return False
+    if sum(row["count"] for row in series) != coverage["timestamp_count"]:
+        return False
+    missing_dates = input_count - coverage["timestamp_count"]
+    if any(not coverage[key] - missing_dates <= sum(row[key] for row in series) <= coverage[key]
+           for key in ("comparison_count", "sentiment_count")):
+        return False
+    by_date = {row["date"]: row for row in series}
+    category_daily_counts: Dict[str, int] = {}
+    for key, category in categories.items():
+        if (not isinstance(category, dict) or category.get("label") != key
+                or category.get("alias") != CATEGORY_ALIAS_MAP[key]
+                or not _valid_visualization_series(category.get("time_series"), maximum=counts[key],
+                                                   first_date=first_date, last_date=last_date)):
+            return False
+        if sum(row["count"] for row in category["time_series"]) < counts[key] - missing_dates:
+            return False
+        for row in category["time_series"]:
+            global_row = by_date.get(row["date"])
+            if global_row is None or any(row[field] > global_row[field] for field in
+                                         ("count", "comparison_count", "sentiment_count", "polarity_count")):
+                return False
+            category_daily_counts[row["date"]] = category_daily_counts.get(row["date"], 0) + row["count"]
+    if any(count > by_date[date]["count"] for date, count in category_daily_counts.items()):
+        return False
+    distribution = charts.get("category_distribution")
+    if not isinstance(distribution, dict) or set(distribution) != set(counts):
+        return False
+    if any(finite_metric(distribution[key], 0, 1) is None or not math.isclose(
+        distribution[key], count / coverage["category_count"], abs_tol=1e-6,
+    ) for key, count in counts.items()):
+        return False
+    sentiment = charts.get("sentiment_distribution")
+    if (not isinstance(sentiment, dict) or set(sentiment) - {"positive", "neutral", "negative"}
+            or any(finite_metric(value, 0, 1) is None or value <= 0 for value in sentiment.values())
+            or bool(sentiment) != bool(coverage["sentiment_count"])):
+        return False
+    if sentiment and not math.isclose(sum(sentiment.values()), 1.0, abs_tol=1e-5):
+        return False
+    histogram, hourly = charts.get("similarity_histogram"), charts.get("hourly_distribution")
+    bins = {"0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"}
+    if (not isinstance(histogram, dict) or set(histogram) != (bins if coverage["comparison_count"] else set())
+            or any(not _cache_count(value, input_count) for value in histogram.values())
+            or sum(histogram.values()) != coverage["comparison_count"]):
+        return False
+    if (not isinstance(hourly, dict) or set(hourly) - {str(hour) for hour in range(24)}
+            or any(not _cache_count(value, input_count, 1) for value in hourly.values())
+            or sum(hourly.values()) != coverage["timestamp_count"]):
+        return False
+    return True
 
 
 def _shape_export_rows(rows: Iterable[Dict[str, Any]], view: str) -> Iterable[Dict[str, Any]]:
@@ -1591,10 +1741,9 @@ def _dashboard_visualization_snapshot(*, days, from_ts, to_ts, limit_rows, force
             ).fetchone()
             if cached:
                 cached_payload = _load_analysis_cache(cached["result_payload"])
-                if (
-                    isinstance(cached_payload, dict)
-                    and cached_payload.get("analysis_status") == "ready"
-                    and not cached_payload.get("pipeline_warning")
+                if _valid_visualization_cache(
+                    cached_payload, from_ts=resolved_from_ts, to_ts=resolved_to_ts,
+                    limit_rows=limit_rows, input_count=input_count, available_count=int(available_count),
                 ):
                     job_id = _insert_analysis_job(
                         conn,

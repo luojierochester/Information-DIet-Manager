@@ -10,6 +10,8 @@ const { chromium } = require('../../chrome-extension/node_modules/playwright');
 
 const root = path.resolve(__dirname, '../..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'idm-lifecycle-e2e-'));
+const database = path.join(temp, 'synthetic.sqlite3');
+const legacyText = '历史'.repeat(750);
 const dist = path.join(temp, 'dist');
 const artifacts = path.join(root, 'output/playwright/display-correctness');
 fs.mkdirSync(artifacts, { recursive: true });
@@ -33,9 +35,9 @@ const ui = http.createServer((request, response) => {
   response.setHeader('Content-Type', filename.endsWith('.js') ? 'text/javascript' : filename.endsWith('.css') ? 'text/css' : filename.endsWith('.svg') ? 'image/svg+xml' : 'text/html');
   response.end(fs.readFileSync(filename));
 });
-function command(args, options) {
+function command(args, options, executable = process.execPath) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, { windowsHide: true, ...options });
+    const child = spawn(executable, args, { windowsHide: true, ...options });
     let output = '';
     child.stdout.on('data', chunk => { output += chunk; }); child.stderr.on('data', chunk => { output += chunk; });
     child.on('error', reject); child.on('exit', code => code === 0 ? resolve() : reject(new Error(output)));
@@ -46,7 +48,7 @@ async function run() {
   const probe = http.createServer(); const apiPort = await listen(probe); await close(probe);
   const api = `http://127.0.0.1:${apiPort}`;
   backend = spawn(process.env.IDM_TEST_PYTHON || 'python', ['-m', 'uvicorn', 'src.backend_api.app:app', '--host', '127.0.0.1', '--port', String(apiPort)], {
-    cwd: root, windowsHide: true, env: { ...process.env, IDM_DB_PATH: path.join(temp, 'synthetic.sqlite3'), IDM_ADMIN_TOKEN: admin,
+    cwd: root, windowsHide: true, env: { ...process.env, IDM_DB_PATH: database, IDM_ADMIN_TOKEN: admin,
       IDM_COLLECTOR_TOKEN: collector, IDM_FRONTEND_ORIGINS: uiOrigin, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', PYTHONUTF8: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -55,6 +57,17 @@ async function run() {
   await until(async () => { try { return (await fetch(api + '/health')).ok; } catch { return false; } }, 'backend');
   for (let i = 0; i < 2; i++) assert.equal((await fetch(api + '/collect', { method: 'POST', headers: { Authorization: 'Bearer ' + collector, 'Content-Type': 'application/json' },
     body: JSON.stringify({ url: 'https://example.invalid/' + i, title: 'Synthetic page ' + i, text: 'Synthetic content', tags: ['W'.repeat(40)], ts: Date.now(), source: 'plugin' }) })).status, 200);
+  // Seed legal historical values directly in this disposable database: normal
+  // collection truncates text, so it cannot create the long-text restore case.
+  await command(['-c', [
+    'import sqlite3, sys',
+    'from src.hyh.utils import normalize_text, sha256_hex',
+    'with sqlite3.connect(sys.argv[1]) as conn:',
+    '    for index, text in enumerate((sys.argv[2], None)):',
+    '        title = "Synthetic page " + str(index)',
+    '        result = conn.execute("UPDATE items SET text = ?, content_hash = ? WHERE url = ?", (text, sha256_hex(normalize_text(title, text)), "https://example.invalid/" + str(index)))',
+    '        assert result.rowcount == 1',
+  ].join('\n'), database, legacyText], { cwd: root, env: { ...process.env, PYTHONUTF8: '1' } }, process.env.IDM_TEST_PYTHON || 'python');
   await command([path.join(root, 'frontend/node_modules/vite/bin/vite.js'), 'build', '--outDir', dist], {
     cwd: path.join(root, 'frontend'), env: { ...process.env, VITE_API_BASE_URL: api },
   });
@@ -185,6 +198,8 @@ async function run() {
   const downloadPromise = page.waitForEvent('download'); await page.getByTestId('backup').click();
   const download = await downloadPromise, backupPath = path.join(temp, 'backup.json'); await download.saveAs(backupPath);
   const backup = JSON.parse(fs.readFileSync(backupPath, 'utf8')); assert.equal(backup.items.length, 2);
+  assert.equal(backup.items.find(item => item.url === 'https://example.invalid/0').text, legacyText);
+  assert.equal(backup.items.find(item => item.url === 'https://example.invalid/1').text, null);
   assert.equal(fs.readFileSync(backupPath, 'utf8').includes(admin), false);
   await until(async () => !(await page.getByTestId('backup').isDisabled()), 'backup complete');
   await page.screenshot({ path: path.join(artifacts, 'connected.png'), fullPage: true });
@@ -259,7 +274,13 @@ async function run() {
   pass('damaged backup is rejected through real upload; current data survives');
   await page.getByTestId('restore-file').setInputFiles(backupPath); page.once('dialog', dialog => dialog.accept()); await page.getByTestId('restore').click();
   await until(async () => await savedTotal.textContent() === '2', 'restore count');
-  pass('valid backup restores the page records through the UI');
+  await until(async () => !(await page.getByTestId('backup').isDisabled()), 'restored backup available');
+  const restoredDownloadPromise = page.waitForEvent('download'); await page.getByTestId('backup').click();
+  const restoredDownload = await restoredDownloadPromise, restoredBackupPath = path.join(temp, 'restored-backup.json');
+  await restoredDownload.saveAs(restoredBackupPath);
+  const restoredBackup = JSON.parse(fs.readFileSync(restoredBackupPath, 'utf8'));
+  assert.deepEqual(restoredBackup.items, backup.items);
+  pass('UI backup, deletion, restore and second download preserve every page field, including 1500-character text and null');
 
   // Hold a real background response, then collect a page that only a later
   // foreground request can see. Keep the browser's real 30-second interval.
