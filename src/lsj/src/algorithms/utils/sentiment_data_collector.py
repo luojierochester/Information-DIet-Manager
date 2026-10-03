@@ -561,10 +561,20 @@ class CircuitBreaker:
 class BaseModelClient:
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
-        self.http = httpx.AsyncClient(timeout=cfg.timeout)
+        self.http: Optional[httpx.AsyncClient] = None
+        self._closed = False
         self.last_request_ts = 0.0
         self.min_interval = 1.0 / max(0.1, cfg.qps_limit)
         self._rate_limit_lock = asyncio.Lock()
+
+    def _get_http(self) -> httpx.AsyncClient:
+        if self._closed:
+            raise RuntimeError("Model client is closed.")
+        if self.http is None:
+            # Allocate at the async request site, never during construction.
+            # No await separates the check, allocation, and ownership assignment.
+            self.http = httpx.AsyncClient(timeout=self.cfg.timeout)
+        return self.http
 
     async def _rate_limit_wait(self):
         async with self._rate_limit_lock:
@@ -578,7 +588,11 @@ class BaseModelClient:
         raise NotImplementedError
 
     async def close(self):
-        await self.http.aclose()
+        self._closed = True
+        if self.http is not None:
+            # Retain the reference if close fails or is cancelled so it can be retried.
+            await self.http.aclose()
+            self.http = None
 
 
 class OpenAIClient(BaseModelClient):
@@ -599,7 +613,8 @@ class OpenAIClient(BaseModelClient):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        r = await self.http.post(url, headers=headers, json=payload)
+        http = self._get_http()
+        r = await http.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]["content"]
@@ -620,7 +635,8 @@ class AnthropicClient(BaseModelClient):
             "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
         }
-        r = await self.http.post(url, headers=headers, json=payload)
+        http = self._get_http()
+        r = await http.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
         if "content" in data and data["content"]:
