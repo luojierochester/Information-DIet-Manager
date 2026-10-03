@@ -689,6 +689,10 @@ class LocalOpenAICompatibleClient(OpenAIClient):
 
 class ModelPool:
     def __init__(self, model_configs: List[ModelConfig], logger: logging.Logger):
+        model_configs = list(model_configs)
+        for cfg in model_configs:
+            if isinstance(cfg.concurrency, bool) or not isinstance(cfg.concurrency, int) or cfg.concurrency <= 0:
+                raise ValueError("Model concurrency must be a positive integer.")
         self.logger = logger
         self.cfgs: Dict[str, ModelConfig] = {c.name: c for c in model_configs}
         self.clients: Dict[str, BaseModelClient] = {}
