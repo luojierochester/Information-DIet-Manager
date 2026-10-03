@@ -587,6 +587,22 @@ def _update_analysis_job(
     )
 
 
+def _recover_interrupted_analysis_jobs() -> None:
+    """Called only during startup while this process owns the database lock."""
+    recovered_at = _now_ms()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = ?, error = ?, finished_at = ?, updated_at = ?
+            WHERE status IN (?, ?)
+            """,
+            (JOB_FAILED, "Analysis was interrupted before this service start; run it again.",
+             recovered_at, recovered_at, JOB_QUEUED, JOB_RUNNING),
+        )
+
+
 class AnalysisUnavailableError(RuntimeError):
     """Expected optional-inference failure; never carries raw model exceptions."""
 
@@ -958,6 +974,7 @@ async def lifespan(_app: FastAPI):
         work_owner = WorkOwner()
         _app.state.work_owner = work_owner
         init_db(_schema_path())
+        _recover_interrupted_analysis_jobs()
         try:
             yield
         finally:
