@@ -72,6 +72,8 @@ npm run dev -- --host 127.0.0.1 --strictPort
 
 `LOCALAPPDATA` 缺失或为空白时，默认位置回退至当前用户的 `~/.local/share/InformationDietManager/`。显式设置的 `IDM_DB_PATH` 为空白或指向已有目录会明确报错，不会悄悄改开另一份数据库。初始化语句整体提交或回滚，未知旧表结构不会自动迁移，详见 [数据库路径与初始化](docs/database-initialization-2026-10-03.md)。
 
+数据库不能与派生的进程锁文件重名，例如 `records.lock`；启动和密钥轮换会在创建文件前拒绝这种配置。同目录的 `records.sqlite3` 与 `records.db` 仍共用 `records.lock` 和 `records.credentials.json`，运行独立实例请使用不同文件主名或目录，详见 [锁路径保护与兼容边界](docs/database-lock-paths-2026-10-03.md)。
+
 前端默认连接 `http://127.0.0.1:8000`；可参考 `frontend/.env.example` 设置 `VITE_API_BASE_URL`，只允许回环地址，修改后重启或重建前端。默认允许的界面来源为 `localhost` / `127.0.0.1` 的 HTTP 5173、4173 端口。如改前端端口，须在启动后端前设置 `IDM_FRONTEND_ORIGINS` 为对应的完整来源，多个值以逗号分隔；不允许通配符或远程来源。使用 `--strictPort` 可避免 Vite 自动换端口造成连接失败。
 
 启动器只监听 `127.0.0.1`，默认单进程且不热重载；开发时可显式加 `--reload`。不要公开代理此服务。同一数据库只允许一个 IDM 服务进程。在线 `/docs`、`/redoc`、`/openapi.json` 已关闭，接口说明见 [API 契约](src/hyh/CONTRACT.md)。

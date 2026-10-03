@@ -27,11 +27,28 @@ BODY_LIMITS = {"/collect": 64 * 1024, "/import": 10 * 1024 * 1024, "/data/restor
 EXPORT_PATHS = frozenset({"/export/lsj", "/export/lsj/training", "/data/backup"})
 
 
+def _database_lock_path(db_path: Path) -> Path:
+    lock_path = db_path.with_suffix(".lock")
+    # with_suffix keeps the parent; compare only the two final names. Normal
+    # Win32 file opens discard trailing ASCII spaces/dots, while \\?\ paths
+    # preserve them. Keep the actual paths and existing sidecar names unchanged.
+    database_name, lock_name = db_path.name, lock_path.name
+    if os.name == "nt":
+        if not str(db_path).startswith("\\\\?\\"):
+            database_name = database_name.rstrip(" .")
+            lock_name = lock_name.rstrip(" .")
+        database_name, lock_name = database_name.lower(), lock_name.lower()
+    if database_name == lock_name:
+        raise RuntimeError("Database path conflicts with its process lock file; choose a different database filename.")
+    return lock_path
+
+
 @contextmanager
 def process_ownership(db_path: Path):
     """One API process per DB; also used by offline credential rotation."""
+    lock_path = _database_lock_path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = open(db_path.with_suffix(".lock"), "a+b")
+    lock = open(lock_path, "a+b")
     try:
         if lock.seek(0, 2) == 0:
             lock.write(b"0")
