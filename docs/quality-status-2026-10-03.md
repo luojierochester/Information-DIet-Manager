@@ -169,6 +169,14 @@ HTTP 关闭成功的本机请求已验收；异常状态测试使用真实 HTTPX
 
 该小批另用真实隔离 Chromium 151.0.7922.34 跨源访问 Uvicorn 与临时 SQLite：空窗口跳过推理，实际整体回滚返回固定安全 500，任务接口为 `failed` / null 结果，结果查询 409，历史与触发器部分写保持不变，移除故障后重试为 200 / empty，旧失败任务保持失败。脚本和证据为 ignored 的 `full-publication-browser.cjs` / `full-publication-browser-result.json`；这是实际浏览器接口验收，不冒充产品页面渲染或真实模型测试。产品前端、扩展、依赖和构建未改，本地完整页面 31 场景仍以上一 `14c4f3c` 为证据，下一精确提交 CI 另行验收。
 
+完整评分回滚修复的精确提交 `57316dd35c5d4de1a96292d48a4a61c3931081a8` 已核验 [GitHub Quality 成功](https://github.com/luojierochester/Information-DIet-Manager/actions/runs/37109074674)：1678 项 Python / 3 条既有警告 / 30 个 subtest（222.88 秒），前端单元 35、扩展单元 38、真实浏览器前端 31 / 扩展 10。提交 SHA、全部 25 个步骤与原始日志均核对；完整应用/工具/安装器及 npm 审计无跳过、无已知漏洞。生产构建通过，原主包大小提示保留。
+
+轻量全库统计后续发现并修复了[独立的缓存复用缺陷](global-statistics-cache-integrity-2026-10-03.md)：有限但缺字段、错误渠道、假情感、缺 hash 伪零或错误日期的 payload 不再继续返回或污染 daily。仅替换复用前的合同检查，原 SQL 计算、事务和前端保持不变。新增 **33 项**旧版为 **27 失败 / 6 通过**；修后相关 186 项通过。独立复查 33 项及 4 个额外真实 API 探针通过，其中 SQLite 在回填与 daily 更新之后拒绝 history 写入，仍保持全库逻辑转储一致，解除故障后可重试。
+
+最终源码冻结后，本地完整 Python **1711 项通过 / 3 条既有警告 / 30 个 subtest，228.17 秒**。真实隔离 Chromium **8 组接口检查通过**：跨源访问真实 Uvicorn 和临时 SQLite，对 summary / analyze run 分别验证四类坏缓存的重算、后续正常命中、旧 payload 保留、daily 正确、原生成时间和各自历史记录规则。轻量统计完全不调用模型；这些是浏览器接口验收，没有将其写成页面渲染验收。日志与脚本在 ignored 目录的 `global-cache-final-pytest.log`、`global-cache-browser.cjs` / `global-cache-browser-result.json`、`global-cache-review/`。
+
+本批没有修改产品前端、扩展、依赖或构建。既有页面 31 / 扩展 10 场景及完整审计为前一 `57316dd` 的证据，新提交推送后按精确 SHA 另行核验。缓存检查不能识别仍满足外层约束的自洽篡改，也不清洗旧历史。同期只读复核未将两项既有产品边界误判为新 bug：机器 CSV 按合同保留公式形文本；规则分类未命中返回合法 Other 标签，标签覆盖数不代表准确率。没有为此改变导出格式、分类政策或界面。
+
 ## 下一阶段按证据推进
 
 | 优先级 | 未完成项 | 完成条件 |

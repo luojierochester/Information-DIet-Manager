@@ -31,6 +31,7 @@ from . import export_io
 from .owned_work import WorkOwner, run_owned_sync
 from .analysis_json import InvalidStoredAnalysis, load_analysis_json, validate_analysis_value
 from .full_analysis_contract import valid_full_analysis_cache
+from .global_statistics_contract import valid_global_statistics_cache
 
 from contextlib import asynccontextmanager, nullcontext
 
@@ -1284,11 +1285,9 @@ def _global_statistics(*, force: bool, backfill_limit: int, record_run: bool) ->
         payload = None
         if not force and existing is not None:
             candidate = _load_analysis_cache(existing["payload"])
-            if (isinstance(candidate, dict)
-                    and candidate.get("statistics_scope") == "all_saved_pages"
-                    and candidate.get("statistics_version") == 1
-                    and candidate.get("data_version") == data_version
-                    and candidate.get("total_count") == item_state["total_count"]):
+            if valid_global_statistics_cache(
+                candidate, day=day, data_version=data_version, total_count=item_state["total_count"],
+            ):
                 payload = {**candidate, "cached": True, "embeddings_backfilled": 0}
 
         if payload is None:
