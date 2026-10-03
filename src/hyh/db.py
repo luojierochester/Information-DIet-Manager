@@ -26,36 +26,44 @@ def _configured_db_path() -> Path:
 DB_PATH = _configured_db_path()
 
 
+@contextmanager
+def _connection_scope(conn: sqlite3.Connection) -> Generator[sqlite3.Connection, None, None]:
+    try:
+        yield conn
+    except BaseException:
+        # Cleanup must not replace the first business/setup/commit failure.
+        # Even a system-level interruption in rollback must attempt close.
+        try:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
+    else:
+        # A standalone close failure is still a failure, even after commit.
+        conn.close()
+
+
 def init_db(schema_path: Path) -> None:
     # A missing/unreadable schema must not create an empty database file.
     schema = schema_path.read_text(encoding="utf-8")
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    try:
+    with _connection_scope(sqlite3.connect(DB_PATH)) as conn:
         # executescript otherwise commits each DDL statement independently.
         # Keep additive setup atomic without attempting to migrate old tables.
         conn.executescript("BEGIN IMMEDIATE;\n" + schema + "\nCOMMIT;")
-    except BaseException:
-        try:
-            conn.rollback()
-        except Exception:
-            pass  # Preserve the initialization error if rollback also fails.
-        raise
-    finally:
-        conn.close()
 
 
 @contextmanager
 def get_conn(*, timeout: float = 5.0) -> Generator[sqlite3.Connection, None, None]:
-    conn = sqlite3.connect(DB_PATH, timeout=timeout)
-    try:
+    with _connection_scope(sqlite3.connect(DB_PATH, timeout=timeout)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA secure_delete = ON")
         yield conn
         conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()

@@ -342,7 +342,8 @@ def test_connection_setup_and_rollback_failures_always_close_handle(tmp_path, mo
         return FailedConnection()
 
     monkeypatch.setattr(db.sqlite3, "connect", connect)
-    with pytest.raises(sqlite3.OperationalError):
+    expected_error = RuntimeError if failure == "rollback" else sqlite3.OperationalError
+    with pytest.raises(expected_error, match="Synthetic body failure" if failure == "rollback" else "Synthetic setup failure"):
         with db.get_conn(timeout=0.125):
             if failure == "rollback":
                 raise RuntimeError("Synthetic body failure")

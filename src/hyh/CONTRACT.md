@@ -244,6 +244,7 @@ Historical job/result/history reads return `409` with `detail.code: "stored_anal
 - cache events are recorded in `analysis_jobs` (`cache_hit = 1`)
 
 ## 6. Error Contract
+- Database scopes preserve the first business/setup/commit error when ordinary rollback or close errors also occur; they always attempt close after rollback. A standalone commit/close failure remains visible. This is not a guarantee of cleanup after device failure or of rollback after a commit; see `docs/database-cleanup-errors-2026-10-03.md`.
 - Collection, import, deletion, restore, lightweight statistics/summary, model analysis and export/backup preparation retain worker ownership through repeated request cancellation. Upload files remain open until import workers stop reading. Their existing success/error and transaction contracts remain unchanged; cancellation is not an undo operation.
 - Each application lifespan tracks these executor Futures and stops admitting new work before shutdown. Already accepted requests that have not started work return fixed `503` with `Retry-After: 5` after closing begins. Lifespan retains the OS database lock until registered workers finish, including Uvicorn's graceful-timeout cancellation path. This does not impose a hard model deadline, cover unregistered read handlers, or guarantee behavior under process crashes/OS force-kill; permanently blocked workers can keep graceful shutdown waiting.
 - invalid `/collect` request fields -> `422`; malformed/unsupported import files -> `400`
